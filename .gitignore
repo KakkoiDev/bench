@@ -1,0 +1,14 @@
+# Ignore all .md files by default
+*.md
+
+# Except these specific files
+!README.md
+!CONTRIBUTING.md
+
+# Test results and benchmarks
+bench-results/
+
+# Temporary files
+*.tmp
+*.log
+.DS_Store
