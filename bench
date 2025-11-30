@@ -118,6 +118,46 @@ check_dependencies() {
   fi
 }
 
+# Get process stats (CPU%, memory in MB) using ps
+# Returns: "cpu_percent memory_mb" or empty if process not found
+get_process_stats() {
+  pid="$1"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    echo ""
+    return
+  fi
+  # ps output: %CPU %MEM RSS (in KB)
+  # Convert RSS to MB
+  stats=$(ps -p "$pid" -o %cpu=,%mem=,rss= 2>/dev/null | tail -1)
+  if [ -n "$stats" ]; then
+    cpu=$(echo "$stats" | awk '{print $1}')
+    rss_kb=$(echo "$stats" | awk '{print $3}')
+    mem_mb=$(echo "scale=2; $rss_kb / 1024" | bc)
+    echo "$cpu $mem_mb"
+  else
+    echo ""
+  fi
+}
+
+# Resolve port to PID using lsof (with timeout to prevent hanging)
+resolve_port_to_pid() {
+  port="$1"
+  # Use timeout if available (3 seconds max)
+  timeout_cmd=""
+  if command -v timeout >/dev/null 2>&1; then
+    timeout_cmd="timeout 3"
+  fi
+
+  if command -v lsof >/dev/null 2>&1; then
+    $timeout_cmd lsof -ti :"$port" -sTCP:LISTEN 2>/dev/null | head -1
+  elif command -v ss >/dev/null 2>&1; then
+    # Fallback to ss
+    $timeout_cmd ss -tlnp 2>/dev/null | grep ":$port " | sed -n 's/.*pid=\([0-9]*\).*/\1/p' | head -1
+  else
+    echo ""
+  fi
+}
+
 # Main entry point
 main() {
   # Default values
@@ -125,8 +165,8 @@ main() {
   NAME=""
   MESSAGE=""
   QUIET=0
-  PID=""
-  PORT=""
+  MONITOR_PID=""
+  MONITOR_PORT=""
   COMMAND=""
 
   # Parse arguments
@@ -201,8 +241,13 @@ main() {
         if [ -z "$1" ]; then
           error "--pid requires an argument"
         fi
-        # shellcheck disable=SC2034
-        PID="$1"  # Used in Phase 4: Server Monitoring
+        # Validate numeric
+        case "$1" in
+          ''|*[!0-9]*)
+            error "--pid requires a numeric argument"
+            ;;
+        esac
+        MONITOR_PID="$1"
         shift
         ;;
       --port)
@@ -210,8 +255,13 @@ main() {
         if [ -z "$1" ]; then
           error "--port requires an argument"
         fi
-        # shellcheck disable=SC2034
-        PORT="$1"  # Used in Phase 4: Server Monitoring
+        # Validate numeric
+        case "$1" in
+          ''|*[!0-9]*)
+            error "--port requires a numeric argument"
+            ;;
+        esac
+        MONITOR_PORT="$1"
         shift
         ;;
       --)
@@ -237,6 +287,21 @@ main() {
   # Check dependencies
   check_dependencies
 
+  # Resolve --port to PID if specified
+  if [ -n "$MONITOR_PORT" ]; then
+    MONITOR_PID=$(resolve_port_to_pid "$MONITOR_PORT")
+    if [ -z "$MONITOR_PID" ]; then
+      error "No process found listening on port $MONITOR_PORT"
+    fi
+  fi
+
+  # Validate PID exists before starting benchmark
+  if [ -n "$MONITOR_PID" ]; then
+    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
+      error "Process $MONITOR_PID does not exist"
+    fi
+  fi
+
   # Auto-generate name if not provided
   if [ -z "$NAME" ]; then
     NAME=$(generate_name "$COMMAND")
@@ -258,6 +323,17 @@ main() {
   times_file=$(mktemp)
   exit_codes_file=$(mktemp)
   runs_file=$(mktemp)
+  server_metrics_file=$(mktemp)
+
+  # Capture initial server metrics for leak detection
+  if [ -n "$MONITOR_PID" ]; then
+    initial_stats=$(get_process_stats "$MONITOR_PID")
+    if [ -n "$initial_stats" ]; then
+      initial_mem=$(echo "$initial_stats" | awk '{print $2}')
+    else
+      initial_mem=0
+    fi
+  fi
 
   if [ "$QUIET" -eq 0 ]; then
     echo "Running '$COMMAND' $RUNS times..." >&2
@@ -302,10 +378,24 @@ main() {
     # Combine stdout/stderr into single log for backwards compatibility
     cat "$stdout_file" "$stderr_file" > "$OUTPUT_DIR/runs/${run_num}.log"
 
+    # Capture server metrics if monitoring
+    run_cpu=""
+    run_mem=""
+    if [ -n "$MONITOR_PID" ]; then
+      server_stats=$(get_process_stats "$MONITOR_PID")
+      if [ -n "$server_stats" ]; then
+        run_cpu=$(echo "$server_stats" | awk '{print $1}')
+        run_mem=$(echo "$server_stats" | awk '{print $2}')
+        echo "$run_cpu $run_mem" >> "$server_metrics_file"
+      fi
+    fi
+
     # Store per-run data as JSON line
-    cat >> "$runs_file" << RUNDATA
-{"run_number":$run_num,"exit_code":$cmd_exit,"start":"$start_iso","end":"$end_iso","duration_seconds":$duration_sec,"duration_ms":$duration_ms,"stdout_bytes":$stdout_bytes,"stderr_bytes":$stderr_bytes}
-RUNDATA
+    server_field=""
+    if [ -n "$run_cpu" ] && [ -n "$run_mem" ]; then
+      server_field=",\"server\":{\"cpu_percent\":$run_cpu,\"memory_mb\":$run_mem}"
+    fi
+    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$server_field}" >> "$runs_file"
 
     # Store results for statistics
     echo "$duration_ms" >> "$times_file"
@@ -393,6 +483,49 @@ RUNDATA
     success_rate=0
   fi
 
+  # Calculate server metrics if monitoring
+  server_json=""
+  if [ -n "$MONITOR_PID" ] && [ -s "$server_metrics_file" ]; then
+    # Get final memory for leak detection
+    final_stats=$(get_process_stats "$MONITOR_PID")
+    if [ -n "$final_stats" ]; then
+      final_mem=$(echo "$final_stats" | awk '{print $2}')
+    else
+      final_mem="$initial_mem"
+    fi
+    mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
+
+    # Calculate CPU stats
+    cpu_mean=$(awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}' "$server_metrics_file")
+    cpu_min=$(awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}' "$server_metrics_file")
+    cpu_max=$(awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}' "$server_metrics_file")
+
+    # Calculate memory stats
+    mem_mean=$(awk '{sum+=$2; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}' "$server_metrics_file")
+    mem_min=$(awk 'NR==1{min=$2} {if($2<min)min=$2} END{printf "%.2f", min}' "$server_metrics_file")
+    mem_max=$(awk 'NR==1{max=$2} {if($2>max)max=$2} END{printf "%.2f", max}' "$server_metrics_file")
+
+    server_json=",
+  \"server\": {
+    \"pid\": $MONITOR_PID,
+    \"cpu\": {
+      \"unit\": \"percent\",
+      \"mean\": $cpu_mean,
+      \"min\": $cpu_min,
+      \"max\": $cpu_max
+    },
+    \"memory\": {
+      \"unit\": \"megabytes\",
+      \"mean\": $mem_mean,
+      \"min\": $mem_min,
+      \"max\": $mem_max,
+      \"initial\": $initial_mem,
+      \"final\": $final_mem,
+      \"delta\": $mem_delta
+    }
+  }"
+  fi
+
   # Build runs array from temp file
   runs_json="["
   first=1
@@ -438,12 +571,12 @@ RUNDATA
     "shell": "$SHELL",
     "pwd": "$PWD"
   },
-  "runs": $runs_json
+  "runs": $runs_json$server_json
 }
 ENDJSON
 
   # Cleanup temp files
-  rm -f "$times_file" "$exit_codes_file" "$runs_file"
+  rm -f "$times_file" "$exit_codes_file" "$runs_file" "$server_metrics_file"
 
   # Output absolute path
   (cd "$OUTPUT_DIR" && pwd)
