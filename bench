@@ -1,0 +1,179 @@
+#!/bin/sh
+# bench - Minimal benchmarking CLI
+# POSIX-compliant shell script (dash-compatible)
+
+set -e
+
+VERSION="1.0.0"
+
+# Error handling
+error() {
+  echo "Error: $1" >&2
+  exit 1
+}
+
+# Show version
+show_version() {
+  echo "bench v${VERSION}"
+  exit 0
+}
+
+# Show help
+show_help() {
+  cat << 'EOF'
+Usage: bench [OPTIONS] COMMAND
+
+Minimal benchmarking CLI - Run commands multiple times and capture structured data.
+
+Options:
+  --runs N          Number of runs (default: 10)
+  --name NAME       Named group (optional, auto-generated from command)
+  --message TEXT    Message describing this run (optional)
+  --quiet           No progress output
+
+  --pid PID         Monitor process by PID
+  --port PORT       Monitor process by port
+
+  --help            Show this help
+  --version         Show version
+
+Examples:
+  bench --runs 10 "curl localhost:8080"
+  bench --runs 20 --name "api-v1" --message "baseline" "curl localhost/api"
+  bench --runs 50 --pid 12345 "curl localhost:8080"
+
+Output:
+  Results saved to: ./bench-results/<name>/<timestamp-pid>/
+    - benchmark.json (all metrics)
+    - runs/*.log (individual run outputs)
+
+EOF
+  exit 0
+}
+
+# Check dependencies
+check_dependencies() {
+  # Check for perl
+  if ! command -v perl >/dev/null 2>&1; then
+    error "Required dependency 'perl' not found. Please install perl."
+  fi
+
+  # Check for bc
+  if ! command -v bc >/dev/null 2>&1; then
+    error "Required dependency 'bc' not found. Please install bc."
+  fi
+
+  # Check for Time::HiRes module
+  if ! perl -MTime::HiRes -e 'exit 0' 2>/dev/null; then
+    error "Required Perl module 'Time::HiRes' not found. Please install libtime-hires-perl or equivalent."
+  fi
+}
+
+# Main entry point
+main() {
+  # Default values
+  RUNS=10
+  NAME=""
+  MESSAGE=""
+  QUIET=0
+  PID=""
+  PORT=""
+  COMMAND=""
+
+  # Parse arguments
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --version)
+        show_version
+        ;;
+      --help)
+        show_help
+        ;;
+      --runs)
+        shift
+        if [ -z "$1" ]; then
+          error "--runs requires an argument"
+        fi
+        # Validate numeric
+        case "$1" in
+          ''|*[!0-9]*)
+            error "--runs requires a numeric argument"
+            ;;
+        esac
+        # Validate positive
+        if [ "$1" -le 0 ]; then
+          error "--runs must be a positive number (at least 1)"
+        fi
+        RUNS="$1"
+        shift
+        ;;
+      --name)
+        shift
+        if [ -z "$1" ]; then
+          error "--name requires an argument"
+        fi
+        NAME="$1"
+        shift
+        ;;
+      --message)
+        shift
+        if [ -z "$1" ]; then
+          error "--message requires an argument"
+        fi
+        MESSAGE="$1"
+        shift
+        ;;
+      --quiet)
+        QUIET=1
+        shift
+        ;;
+      --pid)
+        shift
+        if [ -z "$1" ]; then
+          error "--pid requires an argument"
+        fi
+        PID="$1"
+        shift
+        ;;
+      --port)
+        shift
+        if [ -z "$1" ]; then
+          error "--port requires an argument"
+        fi
+        PORT="$1"
+        shift
+        ;;
+      --)
+        shift
+        COMMAND="$*"
+        break
+        ;;
+      -*)
+        error "Unknown option: $1"
+        ;;
+      *)
+        COMMAND="$*"
+        break
+        ;;
+    esac
+  done
+
+  # Validate command provided
+  if [ -z "$COMMAND" ]; then
+    error "Command required. Use --help for usage information."
+  fi
+
+  # Check dependencies
+  check_dependencies
+
+  # TODO: Implement benchmark logic
+  echo "bench: Would run '$COMMAND' $RUNS times"
+  if [ -n "$NAME" ]; then
+    echo "bench: Named group: $NAME"
+  fi
+  if [ -n "$MESSAGE" ]; then
+    echo "bench: Message: $MESSAGE"
+  fi
+}
+
+main "$@"
