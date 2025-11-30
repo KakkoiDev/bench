@@ -5,6 +5,12 @@
 set -e
 
 VERSION="1.0.0"
+SCHEMA_VERSION="1.0"
+
+# Global state for signal handling
+INTERRUPTED=0
+RUNS_COMPLETED=0
+OUTPUT_DIR=""
 
 # Error handling
 error() {
@@ -49,6 +55,49 @@ Output:
 
 EOF
   exit 0
+}
+
+# Signal handler for SIGINT/SIGTERM (invoked via trap)
+# shellcheck disable=SC2329
+handle_interrupt() {
+  INTERRUPTED=1
+}
+
+# Get current time in seconds with microsecond precision
+get_time() {
+  perl -MTime::HiRes=time -e 'printf "%.6f\n", time()'
+}
+
+# Get ISO 8601 timestamp with milliseconds
+get_iso_timestamp() {
+  perl -MTime::HiRes=gettimeofday -MPOSIX=strftime -e '
+    my ($s, $us) = gettimeofday();
+    my $ms = int($us / 1000);
+    print strftime("%Y-%m-%dT%H:%M:%S", localtime($s)) . sprintf(".%03d", $ms) . "\n";
+  '
+}
+
+# Normalize bc output to always have leading zero
+bc_normalize() {
+  echo "$1" | bc | sed 's/^\./0./; s/^-\./-0./'
+}
+
+# Generate auto-name from command
+# Algorithm: Remove quotes/special chars → lowercase → spaces to dashes → remove consecutive dashes → truncate 50 → trim trailing dashes
+# Falls back to "benchmark" if result is empty (e.g., command is all special chars)
+generate_name() {
+  name=$(echo "$1" | \
+    tr -cd 'a-zA-Z0-9 -' | \
+    tr '[:upper:]' '[:lower:]' | \
+    tr ' ' '-' | \
+    sed 's/--*/-/g' | \
+    cut -c1-50 | \
+    sed 's/-$//')
+  if [ -z "$name" ]; then
+    echo "benchmark"
+  else
+    echo "$name"
+  fi
 }
 
 # Check dependencies
@@ -104,6 +153,18 @@ main() {
         if [ "$1" -le 0 ]; then
           error "--runs must be a positive number (at least 1)"
         fi
+        # Pre-flight disk space check for large runs (estimate 10MB per run)
+        if [ "$1" -gt 10000 ]; then
+          # Get available disk space in KB
+          available_kb=$(df -k . 2>/dev/null | awk 'NR==2 {print $4}')
+          if [ -n "$available_kb" ]; then
+            # Estimate needed: runs * 10MB = runs * 10240 KB
+            needed_kb=$((${1} * 10240 / 1000))
+            if [ "$available_kb" -lt "$needed_kb" ]; then
+              error "Insufficient disk space for $1 runs (need ~$((needed_kb / 1024))MB, have ~$((available_kb / 1024))MB)"
+            fi
+          fi
+        fi
         RUNS="$1"
         shift
         ;;
@@ -112,6 +173,10 @@ main() {
         if [ -z "$1" ]; then
           error "--name requires an argument"
         fi
+        # Validate length (max 255 chars)
+        if [ "${#1}" -gt 255 ]; then
+          error "--name must be 255 characters or less"
+        fi
         NAME="$1"
         shift
         ;;
@@ -119,6 +184,10 @@ main() {
         shift
         if [ -z "$1" ]; then
           error "--message requires an argument"
+        fi
+        # Validate length (max 1000 chars)
+        if [ "${#1}" -gt 1000 ]; then
+          error "--message must be 1000 characters or less"
         fi
         MESSAGE="$1"
         shift
@@ -132,7 +201,8 @@ main() {
         if [ -z "$1" ]; then
           error "--pid requires an argument"
         fi
-        PID="$1"
+        # shellcheck disable=SC2034
+        PID="$1"  # Used in Phase 4: Server Monitoring
         shift
         ;;
       --port)
@@ -140,7 +210,8 @@ main() {
         if [ -z "$1" ]; then
           error "--port requires an argument"
         fi
-        PORT="$1"
+        # shellcheck disable=SC2034
+        PORT="$1"  # Used in Phase 4: Server Monitoring
         shift
         ;;
       --)
@@ -166,14 +237,195 @@ main() {
   # Check dependencies
   check_dependencies
 
-  # TODO: Implement benchmark logic
-  echo "bench: Would run '$COMMAND' $RUNS times"
-  if [ -n "$NAME" ]; then
-    echo "bench: Named group: $NAME"
+  # Auto-generate name if not provided
+  if [ -z "$NAME" ]; then
+    NAME=$(generate_name "$COMMAND")
   fi
-  if [ -n "$MESSAGE" ]; then
-    echo "bench: Message: $MESSAGE"
+
+  # Create output directory: ./bench-results/<name>/YYYYMMDD-HHMMSS-PID/
+  timestamp=$(date '+%Y%m%d-%H%M%S')
+  OUTPUT_DIR="./bench-results/${NAME}/${timestamp}-$$"
+  mkdir -p "$OUTPUT_DIR/runs"
+
+  # Setup signal handlers
+  trap 'handle_interrupt' INT TERM
+
+  # Disable exit on error for benchmark loop (we track failures ourselves)
+  set +e
+
+  # Run benchmark loop
+  run_num=1
+  times_file=$(mktemp)
+  exit_codes_file=$(mktemp)
+  runs_file=$(mktemp)
+
+  if [ "$QUIET" -eq 0 ]; then
+    echo "Running '$COMMAND' $RUNS times..." >&2
   fi
+
+  while [ "$run_num" -le "$RUNS" ] && [ "$INTERRUPTED" -eq 0 ]; do
+    if [ "$QUIET" -eq 0 ]; then
+      printf "\r  Run %d/%d" "$run_num" "$RUNS" >&2
+    fi
+
+    # Capture timestamps and timing
+    start_iso=$(get_iso_timestamp)
+    start_time=$(get_time)
+
+    # Run command in background to allow signal handling
+    # Capture stdout and stderr separately
+    stdout_file="$OUTPUT_DIR/runs/${run_num}.stdout"
+    stderr_file="$OUTPUT_DIR/runs/${run_num}.stderr"
+    sh -c "$COMMAND" > "$stdout_file" 2> "$stderr_file" &
+    cmd_pid=$!
+    wait $cmd_pid 2>/dev/null
+    cmd_exit=$?
+
+    end_time=$(get_time)
+    end_iso=$(get_iso_timestamp)
+
+    # Check for interrupt after each run
+    if [ "$INTERRUPTED" -eq 1 ]; then
+      # Kill any remaining child process
+      kill $cmd_pid 2>/dev/null || true
+      break
+    fi
+
+    # Calculate durations
+    duration_ms=$(bc_normalize "scale=6; ($end_time - $start_time) * 1000")
+    duration_sec=$(bc_normalize "scale=6; $end_time - $start_time")
+
+    # Get output sizes
+    stdout_bytes=$(wc -c < "$stdout_file")
+    stderr_bytes=$(wc -c < "$stderr_file")
+
+    # Combine stdout/stderr into single log for backwards compatibility
+    cat "$stdout_file" "$stderr_file" > "$OUTPUT_DIR/runs/${run_num}.log"
+
+    # Store per-run data as JSON line
+    cat >> "$runs_file" << RUNDATA
+{"run_number":$run_num,"exit_code":$cmd_exit,"start":"$start_iso","end":"$end_iso","duration_seconds":$duration_sec,"duration_ms":$duration_ms,"stdout_bytes":$stdout_bytes,"stderr_bytes":$stderr_bytes}
+RUNDATA
+
+    # Store results for statistics
+    echo "$duration_ms" >> "$times_file"
+    echo "$cmd_exit" >> "$exit_codes_file"
+
+    RUNS_COMPLETED=$run_num
+    run_num=$((run_num + 1))
+  done
+
+  if [ "$QUIET" -eq 0 ]; then
+    echo "" >&2
+  fi
+
+  # Re-enable exit on error
+  set -e
+
+  # Calculate statistics
+  runs_successful=0
+  runs_failed=0
+  while IFS= read -r code; do
+    if [ "$code" -eq 0 ]; then
+      runs_successful=$((runs_successful + 1))
+    else
+      runs_failed=$((runs_failed + 1))
+    fi
+  done < "$exit_codes_file"
+
+  # Calculate timing statistics
+  if [ "$RUNS_COMPLETED" -gt 0 ]; then
+    # Sort times for median/percentiles
+    sorted_times=$(sort -n "$times_file")
+
+    # Min/Max
+    time_min=$(echo "$sorted_times" | head -1)
+    time_max=$(echo "$sorted_times" | tail -1)
+
+    # Mean
+    time_sum=$(awk '{sum+=$1} END {printf "%.6f", sum}' "$times_file")
+    time_mean=$(bc_normalize "scale=6; $time_sum / $RUNS_COMPLETED")
+
+    # Median
+    mid=$((RUNS_COMPLETED / 2))
+    if [ $((RUNS_COMPLETED % 2)) -eq 0 ]; then
+      val1=$(echo "$sorted_times" | sed -n "${mid}p")
+      val2=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
+      time_median=$(bc_normalize "scale=6; ($val1 + $val2) / 2")
+    else
+      time_median=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
+    fi
+  else
+    time_min=0
+    time_max=0
+    time_mean=0
+    time_median=0
+  fi
+
+  # Calculate success rate
+  if [ "$RUNS_COMPLETED" -gt 0 ]; then
+    success_rate=$(bc_normalize "scale=2; $runs_successful * 100 / $RUNS_COMPLETED")
+  else
+    success_rate=0
+  fi
+
+  # Build runs array from temp file
+  runs_json="["
+  first=1
+  while IFS= read -r line; do
+    if [ "$first" -eq 1 ]; then
+      first=0
+    else
+      runs_json="$runs_json,"
+    fi
+    runs_json="$runs_json
+    $line"
+  done < "$runs_file"
+  runs_json="$runs_json
+  ]"
+
+  # Generate JSON output
+  cat > "$OUTPUT_DIR/benchmark.json" << ENDJSON
+{
+  "schema_version": "$SCHEMA_VERSION",
+  "tool": "bench",
+  "tool_version": "$VERSION",
+  "name": "$NAME",
+  "message": "$MESSAGE",
+  "command": "$COMMAND",
+  "runs_requested": $RUNS,
+  "runs_completed": $RUNS_COMPLETED,
+  "runs_successful": $runs_successful,
+  "runs_failed": $runs_failed,
+  "success_rate": $success_rate,
+  "interrupted": $([ "$INTERRUPTED" -eq 1 ] && echo "true" || echo "false"),
+  "timing": {
+    "unit": "milliseconds",
+    "min": $time_min,
+    "max": $time_max,
+    "mean": $time_mean,
+    "median": $time_median
+  },
+  "environment": {
+    "os": "$(uname -s)",
+    "shell": "$SHELL",
+    "pwd": "$PWD"
+  },
+  "runs": $runs_json
+}
+ENDJSON
+
+  # Cleanup temp files
+  rm -f "$times_file" "$exit_codes_file" "$runs_file"
+
+  # Output absolute path
+  (cd "$OUTPUT_DIR" && pwd)
+
+  # Exit with appropriate code
+  if [ "$INTERRUPTED" -eq 1 ]; then
+    exit 130
+  fi
+  exit 0
 }
 
 main "$@"
