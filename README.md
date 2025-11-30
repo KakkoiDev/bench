@@ -2,8 +2,6 @@
 
 > Minimal data logger for command benchmarking with server monitoring
 
-**Unix Philosophy**: Do one thing well - capture structured benchmark data.
-
 <!-- TODO: Add visual demo (asciinema/screenshot) after v1.0 implementation complete -->
 
 ## Quick Start
@@ -24,22 +22,73 @@ cd bench && chmod +x bench
 ./bench --name "api-v1" --message "with Redis" --pid 12345 "curl localhost/api"
 ```
 
+## Tutorial
+
+### Basic usage
+
+```bash
+# Run a command 10 times (default), get timing stats
+./bench "echo hello"
+
+# Specify number of runs
+./bench --runs 20 "curl -s localhost:8080"
+
+# Quiet mode (no progress output)
+./bench --runs 50 --quiet "sleep 0.1"
+```
+
+### Organize results
+
+```bash
+# Name your experiment
+./bench --name "api-test" --runs 10 "curl localhost:8080"
+
+# Add a message to track what changed
+./bench --name "api-test" --message "baseline" "curl localhost:8080"
+./bench --name "api-test" --message "with cache" "curl localhost:8080"
+```
+
+Results saved to:
+```
+./bench-results/api-test/
+  20251130-150000-12345/   # baseline
+  20251130-150100-12346/   # with cache
+```
+
+### Monitor server resources
+
+```bash
+# Start your server
+python3 -m http.server 8080 &
+SERVER_PID=$!
+
+# Benchmark with CPU/memory monitoring
+./bench --runs 20 --pid $SERVER_PID "curl -s localhost:8080"
+
+# Or by port (auto-resolves PID)
+./bench --runs 20 --port 8080 "curl -s localhost:8080"
+```
+
+### Read results
+
+```bash
+# bench outputs the results path to stdout
+RESULTS=$(./bench --quiet --runs 5 "echo test")
+
+# View the JSON
+cat "$RESULTS/benchmark.json" | jq '.timing'
+```
+
 ## Why bench?
 
-**bench fills a unique gap in the benchmarking ecosystem** - it adds server resource monitoring and persistent organized logs to any benchmarking tool.
+bench is a **universal command benchmarker** - it captures execution time metrics for any CLI command while optionally monitoring server resources.
 
 ### What makes bench different
 
 - **Server resource monitoring** - Track CPU/memory during benchmarks (not in [hyperfine](https://github.com/sharkdp/hyperfine), [ab](https://httpd.apache.org/docs/2.4/programs/ab.html), [wrk](https://github.com/wg/wrk))
 - **Persistent organized results** - Named groups with timestamps, not one-off stdout
 - **Context tracking** - `--message` flag documents what changed between runs
-- **Works WITH other tools** - Wrap hyperfine/ab/wrk/k6 to ADD monitoring and logs
-- **AI/LLM-ready output** - Structured JSON schema for automated analysis
 - **Human-first CLI** - Follows [clig.dev](https://clig.dev) best practices
-
-### Where bench fits
-
-bench is a **universal command benchmarker** - it captures execution time metrics for any CLI command while optionally monitoring server resources.
 
 #### What bench captures
 
@@ -70,7 +119,7 @@ Feed directly to Claude, GPT, or scripts for trend analysis, anomaly detection, 
 | Scenario | Without bench | With bench |
 |----------|---------------|------------|
 | "How fast is this command?" | `time` gives one sample | Stats across N runs + JSON |
-| "Is my server leaking memory?" | Watch htop manually | `--pid` tracks delta automatically |
+| "Is my server leaking memory?" | Watch `htop` manually | `--pid` tracks delta automatically |
 | "Compare before/after optimization" | Copy/paste somewhere | Named groups organize experiments |
 | "Analyze with AI" | Screenshot terminal | Structured JSON, paste and ask |
 
@@ -313,17 +362,9 @@ Continues all runs even if command fails:
 
 ## Design Philosophy
 
-**POSIX shell syntax**: Written in POSIX sh (dash-compatible), not bash-specific. Portable shell code across Linux, macOS, BSD.
+See [PHILOSOPHY.md](PHILOSOPHY.md) for detailed design decisions.
 
-**Unix tools required**: Depends on common Unix utilities (`perl`, `bc`, `top`) that aren't strictly POSIX but are universally available. The script is POSIX-compliant, the runtime requires Unix tools.
-
-**Long-only flags**: No short flags (--runs, not -r) to avoid namespace conflicts and improve clarity.
-
-**JSON-only output**: No summary.txt. Use jq/llm/scripts for human-readable formatting.
-
-**Millisecond precision**: Uses Perl Time::HiRes (portable) or date +%s.%N (modern systems).
-
-**Timestamp-PID directories**: Prevents collisions when running concurrent benchmarks.
+**TL;DR**: POSIX shell, JSON-only output, long flags only, millisecond precision, Unix tools.
 
 ## Development
 
@@ -369,4 +410,5 @@ MIT License - See [LICENSE](LICENSE) file for details.
 
 - **GitHub**: https://github.com/KakkoiDev/bench
 - **Issues**: https://github.com/KakkoiDev/bench/issues
+- **Design Philosophy**: [PHILOSOPHY.md](PHILOSOPHY.md)
 - **CLI Design**: [clig.dev](https://clig.dev) - Command Line Interface Guidelines
