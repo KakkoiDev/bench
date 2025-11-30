@@ -53,6 +53,10 @@ Output:
     - benchmark.json (all metrics)
     - runs/*.log (individual run outputs)
 
+More info:
+  https://github.com/KakkoiDev/bench
+  https://github.com/KakkoiDev/bench/issues
+
 EOF
   exit 0
 }

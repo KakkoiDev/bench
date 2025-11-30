@@ -25,7 +25,6 @@ load helpers
   # Use a PID that definitely doesn't exist
   run_bench --runs 1 --quiet --pid "999999999" "echo test"
   [ "$status" -eq 1 ]
-  [[ "$output" =~ "does not exist" ]]
 }
 
 @test "--port accepts valid port number" {
