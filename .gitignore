@@ -14,3 +14,7 @@ bench-results/
 *.tmp
 *.log
 .DS_Store
+
+# Generated demo files (mp4 hosted on GitHub CDN)
+*.gif
+*.mp4
