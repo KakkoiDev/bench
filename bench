@@ -355,11 +355,35 @@ RUNDATA
     else
       time_median=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
     fi
+
+    # Standard deviation (sample stddev with n-1 denominator)
+    # Formula: sqrt(sum((x - mean)^2) / (n - 1))
+    if [ "$RUNS_COMPLETED" -gt 1 ]; then
+      sum_sq_diff=$(awk -v mean="$time_mean" '{diff=$1-mean; sum+=diff*diff} END {printf "%.6f", sum}' "$times_file")
+      time_stddev=$(bc_normalize "scale=6; sqrt($sum_sq_diff / ($RUNS_COMPLETED - 1))")
+    else
+      time_stddev=0
+    fi
+
+    # Percentiles using nearest rank method
+    # Formula: rank = ceil(percentile * n)
+    # p95
+    p95_rank=$(echo "scale=0; ($RUNS_COMPLETED * 95 + 99) / 100" | bc)
+    [ "$p95_rank" -gt "$RUNS_COMPLETED" ] && p95_rank=$RUNS_COMPLETED
+    time_p95=$(echo "$sorted_times" | sed -n "${p95_rank}p")
+
+    # p99
+    p99_rank=$(echo "scale=0; ($RUNS_COMPLETED * 99 + 99) / 100" | bc)
+    [ "$p99_rank" -gt "$RUNS_COMPLETED" ] && p99_rank=$RUNS_COMPLETED
+    time_p99=$(echo "$sorted_times" | sed -n "${p99_rank}p")
   else
     time_min=0
     time_max=0
     time_mean=0
     time_median=0
+    time_stddev=0
+    time_p95=0
+    time_p99=0
   fi
 
   # Calculate success rate
@@ -404,7 +428,10 @@ RUNDATA
     "min": $time_min,
     "max": $time_max,
     "mean": $time_mean,
-    "median": $time_median
+    "median": $time_median,
+    "stddev": $time_stddev,
+    "p95": $time_p95,
+    "p99": $time_p99
   },
   "environment": {
     "os": "$(uname -s)",
