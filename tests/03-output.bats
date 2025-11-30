@@ -121,3 +121,78 @@ load helpers
   # Should create directory named "benchmark"
   [ -d "$TEST_TEMP_DIR/bench-results/benchmark" ]
 }
+
+@test "timing statistics include stddev" {
+  cd "$TEST_TEMP_DIR"
+  run_bench --runs 5 --quiet "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+
+  # stddev should be present in timing object
+  grep -q '"stddev":' "$json_file"
+}
+
+@test "timing statistics include p95 and p99" {
+  cd "$TEST_TEMP_DIR"
+  run_bench --runs 10 --quiet "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+
+  # p95 and p99 should be present
+  grep -q '"p95":' "$json_file"
+  grep -q '"p99":' "$json_file"
+}
+
+@test "stddev is zero for single run" {
+  cd "$TEST_TEMP_DIR"
+  run_bench --runs 1 --quiet "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+
+  # stddev should be 0 for single run (can't calculate variance)
+  grep -q '"stddev": *0' "$json_file" || grep -q '"stddev":0' "$json_file"
+}
+
+@test "concurrent benchmarks create unique directories" {
+  cd "$TEST_TEMP_DIR"
+
+  # Run two benchmarks in parallel with same command
+  "$BENCH_SCRIPT" --runs 3 --quiet "echo test" &
+  pid1=$!
+  "$BENCH_SCRIPT" --runs 3 --quiet "echo test" &
+  pid2=$!
+
+  wait $pid1
+  wait $pid2
+
+  # Should have two different directories (timestamp-PID suffix ensures uniqueness)
+  dir_count=$(find "$TEST_TEMP_DIR/bench-results/echo-test" -maxdepth 1 -type d | wc -l)
+  # Should be 3: the echo-test dir itself + 2 timestamp-PID subdirs
+  [ "$dir_count" -ge 3 ]
+}
+
+@test "auto-naming converts spaces to dashes" {
+  cd "$TEST_TEMP_DIR"
+  run_bench --runs 1 --quiet "echo hello world"
+  [ "$status" -eq 0 ]
+
+  # Should create directory with dashes
+  [ -d "$TEST_TEMP_DIR/bench-results/echo-hello-world" ]
+}
+
+@test "auto-naming truncates to 50 characters" {
+  cd "$TEST_TEMP_DIR"
+  # Command that would generate a very long name
+  long_cmd="echo aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  run_bench --runs 1 --quiet "$long_cmd"
+  [ "$status" -eq 0 ]
+
+  # Find the created directory name
+  dir_name=$(ls "$TEST_TEMP_DIR/bench-results" | head -1)
+
+  # Should be 50 chars or less
+  [ "${#dir_name}" -le 50 ]
+}
