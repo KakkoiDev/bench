@@ -39,23 +39,68 @@ cd bench && chmod +x bench
 
 ### Where bench fits
 
-| Tool | Purpose | Use With bench? |
-|------|---------|-----------------|
-| [**hyperfine**](https://github.com/sharkdp/hyperfine) | Statistical command comparison | ✅ Add server monitoring |
-| [**ab**](https://httpd.apache.org/docs/2.4/programs/ab.html)/[**wrk**](https://github.com/wg/wrk)/[**hey**](https://github.com/rakyll/hey) | HTTP load testing | ✅ Add server resource tracking |
-| [**k6**](https://github.com/grafana/k6) | Complex load scenarios | ✅ Track server metrics over time |
-| **bench** | Server monitoring + persistent logs | Use standalone or wrap others |
+bench is a **universal command benchmarker** - it captures execution time metrics for any CLI command while optionally monitoring server resources.
 
-**bench is NOT**:
-- A replacement for specialized tools
-- A statistical analysis tool (use jq/Python/LLM)
-- HTTP-specific (use ab/wrk/hey, optionally with bench)
+#### What bench captures
 
-**Use bench when you need**:
-- Server CPU/memory during benchmarks
-- Organized persistent results (not just stdout)
-- Iterative optimization tracking (baseline → v2 → v3)
-- AI/LLM analysis of performance trends
+- **Timing**: mean, median, stddev, min, max, p95, p99 (milliseconds)
+- **Per-run data**: duration, exit code, timestamps, stdout/stderr byte counts
+- **Server metrics** (with `--pid`/`--port`): CPU%, memory MB, leak detection
+
+#### AI/LLM-friendly output
+
+bench outputs structured JSON designed for automated analysis:
+
+```json
+{
+  "schema_version": "1.0",
+  "timing": { "mean": 67.70, "p95": 81.00, "stddev": 16.22, ... },
+  "runs": [
+    { "run_number": 1, "duration_ms": 72.47, "exit_code": 0, ... },
+    ...
+  ],
+  "server": { "memory": { "initial": 45.2, "final": 47.8, "delta": 2.6 }, ... }
+}
+```
+
+Feed directly to Claude, GPT, or scripts for trend analysis, anomaly detection, or optimization suggestions.
+
+#### Use cases
+
+| Scenario | Without bench | With bench |
+|----------|---------------|------------|
+| "How fast is this command?" | `time` gives one sample | Stats across N runs + JSON |
+| "Is my server leaking memory?" | Watch htop manually | `--pid` tracks delta automatically |
+| "Compare before/after optimization" | Copy/paste somewhere | Named groups organize experiments |
+| "Analyze with AI" | Screenshot terminal | Structured JSON, paste and ask |
+
+#### Works with any command
+
+```bash
+# Build tools
+bench --runs 5 "make clean && make"
+
+# Database queries
+bench --runs 20 "psql -c 'SELECT count(*) FROM users'"
+
+# File operations
+bench --runs 50 "find . -name '*.log' | wc -l"
+
+# Scripts
+bench --runs 10 "python process_data.py"
+
+# With server monitoring
+bench --runs 30 --pid $SERVER_PID "curl -s localhost:8080/api"
+```
+
+#### Complements specialized tools
+
+| Tool | What it does | What bench adds |
+|------|--------------|-----------------|
+| [hyperfine](https://github.com/sharkdp/hyperfine) | Statistical CLI comparison | Server monitoring + persistent logs |
+| [ab](https://httpd.apache.org/docs/2.4/programs/ab.html) / [wrk](https://github.com/wg/wrk) | HTTP load generation | CPU/memory tracking during load |
+| [k6](https://github.com/grafana/k6) | Scriptable load testing | Server-side metrics + organized logs |
+| [time](https://man7.org/linux/man-pages/man1/time.1.html) | Single command timing | N runs + statistics + JSON |
 
 ## Installation
 
