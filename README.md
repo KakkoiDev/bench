@@ -329,7 +329,7 @@ bench --name "stress-test" --pid 12345 \
 
 ### Auto-naming
 
-If --name not provided, generates from command:
+If `--name` not provided, generates from command:
 - `curl localhost:8080/api` → `curl-localhost-8080-api`
 - `echo "hello world"` → `echo-hello-world`
 
@@ -405,10 +405,3 @@ Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guideli
 ## License
 
 MIT License - See [LICENSE](LICENSE) file for details.
-
-## Links
-
-- **GitHub**: https://github.com/KakkoiDev/bench
-- **Issues**: https://github.com/KakkoiDev/bench/issues
-- **Design Philosophy**: [PHILOSOPHY.md](PHILOSOPHY.md)
-- **CLI Design**: [clig.dev](https://clig.dev) - Command Line Interface Guidelines

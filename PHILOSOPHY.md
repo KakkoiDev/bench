@@ -82,3 +82,8 @@ bench --pid $SERVER "hyperfine 'curl localhost'"
 # Pipe to analysis
 bench --quiet "cmd" | xargs -I {} cat {}/benchmark.json | jq
 ```
+
+## References
+
+- [clig.dev](https://clig.dev) - Command Line Interface Guidelines
+- [Unix Philosophy](https://en.wikipedia.org/wiki/Unix_philosophy) - Do one thing well
