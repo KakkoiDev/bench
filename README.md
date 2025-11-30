@@ -2,7 +2,7 @@
 
 > Minimal data logger for command benchmarking with server monitoring
 
-![bench demo](demo.gif)
+https://github.com/user-attachments/assets/VIDEO_ID
 
 ## Quick Start
 
