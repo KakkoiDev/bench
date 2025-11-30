@@ -4,6 +4,7 @@
 # Except these specific files
 !README.md
 !CONTRIBUTING.md
+!DEVELOPMENT.md
 !PHILOSOPHY.md
 
 # Test results and benchmarks

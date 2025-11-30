@@ -2,7 +2,7 @@
 
 > Minimal data logger for command benchmarking with server monitoring
 
-<!-- TODO: Add visual demo (asciinema/screenshot) after v1.0 implementation complete -->
+![bench demo](demo.gif)
 
 ## Quick Start
 
@@ -368,35 +368,7 @@ See [PHILOSOPHY.md](PHILOSOPHY.md) for detailed design decisions.
 
 ## Development
 
-### Running Tests
-
-Tests use [BATS](https://github.com/bats-core/bats-core) (Bash Automated Testing System):
-
-```bash
-# Install BATS (if not already installed)
-git clone https://github.com/bats-core/bats-core.git
-sudo ./bats-core/install.sh /usr/local
-
-# Run all tests
-bats tests/
-
-# Run specific test file
-bats tests/01-foundation.bats
-
-# Run with verbose output
-bats -t tests/
-```
-
-### Development Dependencies
-
-```bash
-# Debian/Ubuntu
-sudo apt-get install shellcheck dash
-
-# Validate POSIX compliance
-shellcheck -s sh bench
-dash -n bench
-```
+See [DEVELOPMENT.md](DEVELOPMENT.md) for testing, development dependencies, and demo recording instructions.
 
 ## Contributing
 
