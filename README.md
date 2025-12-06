@@ -22,16 +22,9 @@ bench --port 8080 "k6 run load-test.js"
 
 ## Installation
 
-:one: Clone the repository
-
 ```bash
 git clone https://github.com/KakkoiDev/bench.git
 cd bench
-```
-
-:two: Make `bench` executable and symlink to PATH
-
-```bash
 chmod +x bench
 sudo ln -s "$(pwd)/bench" /usr/local/bin/bench
 ```
@@ -140,7 +133,7 @@ jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
 cat bench-results/api/*/benchmark.json | claude "compare these runs, identify bottlenecks"
 ```
 
-**Stress test with xargs:**
+**Stress test with [xargs](https://man7.org/linux/man-pages/man1/xargs.1.html):**
 
 ```bash
 bench --name "stress" --port 8080 \
