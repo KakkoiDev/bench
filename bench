@@ -33,14 +33,14 @@ Minimal benchmarking CLI - Run commands multiple times and capture structured da
 
 Options:
   --runs N          Number of runs (default: 10)
-  --name NAME       Named group (optional, auto-generated from command)
-  --message TEXT    Message describing this run (optional)
-  --quiet           No progress output
+  --name NAME       Named group for organizing results
+  --message TEXT    Describe what changed (e.g., "baseline", "with cache")
+  --quiet           Suppress progress output, only print results path
 
-  --pid PID         Monitor process by PID
-  --port PORT       Monitor process by port
+  --pid PID         Monitor process CPU/memory by PID
+  --port PORT       Monitor process by port (auto-resolves PID)
 
-  --help            Show this help
+  --help            Show help
   --version         Show version
 
 Examples:
