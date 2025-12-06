@@ -1,379 +1,196 @@
 # bench
 
-> Minimal data logger for command benchmarking with server monitoring
+Simple command timing + server monitoring + AI-friendly persistent logs.
 
 https://github.com/user-attachments/assets/50bbcdeb-6e21-43a8-a898-fdbb0045ebb2
 
-## Quick Start
-
-```bash
-# Install
-git clone https://github.com/KakkoiDev/bench.git
-cd bench && chmod +x bench
-
-# Basic benchmark
-./bench --runs 10 "curl localhost:8080"
-
-# With server monitoring
-./bench --runs 50 --pid 12345 "curl localhost:8080"
-
-# Compare iterations
-./bench --name "api-v1" --message "baseline" --pid 12345 "curl localhost/api"
-./bench --name "api-v1" --message "with Redis" --pid 12345 "curl localhost/api"
-```
-
-## Tutorial
-
-### Basic usage
-
-```bash
-# Run a command 10 times (default), get timing stats
-./bench "echo hello"
-
-# Specify number of runs
-./bench --runs 20 "curl -s localhost:8080"
-
-# Quiet mode (no progress output)
-./bench --runs 50 --quiet "sleep 0.1"
-```
-
-### Organize results
-
-```bash
-# Name your experiment
-./bench --name "api-test" --runs 10 "curl localhost:8080"
-
-# Add a message to track what changed
-./bench --name "api-test" --message "baseline" "curl localhost:8080"
-./bench --name "api-test" --message "with cache" "curl localhost:8080"
-```
-
-Results saved to:
-```
-./bench-results/api-test/
-  20251130-150000-12345/   # baseline
-  20251130-150100-12346/   # with cache
-```
-
-### Monitor server resources
-
-```bash
-# Start your server
-python3 -m http.server 8080 &
-SERVER_PID=$!
-
-# Benchmark with CPU/memory monitoring
-./bench --runs 20 --pid $SERVER_PID "curl -s localhost:8080"
-
-# Or by port (auto-resolves PID)
-./bench --runs 20 --port 8080 "curl -s localhost:8080"
-```
-
-### Read results
-
-```bash
-# bench outputs the results path to stdout
-RESULTS=$(./bench --quiet --runs 5 "echo test")
-
-# View the JSON
-cat "$RESULTS/benchmark.json" | jq '.timing'
-```
-
 ## Why bench?
 
-bench is a **universal command benchmarker** - it captures execution time metrics for any CLI command while optionally monitoring server resources.
+**The gap:** Existing tools ([time](https://man7.org/linux/man-pages/man1/time.1.html), [hyperfine](https://github.com/sharkdp/hyperfine), [k6](https://github.com/grafana/k6), [ab](https://httpd.apache.org/docs/2.4/programs/ab.html), [wrk](https://github.com/wg/wrk)) don't track server CPU/memory during execution, and most output to stdout only.
 
-### What makes bench different
+**bench adds:**
+- Server CPU/memory monitoring via `--pid` or `--port`
+- Persistent, organized JSON logs you can compare across runs
+- AI-friendly output for LLM analysis
 
-- **Server resource monitoring** - Track CPU/memory during benchmarks (not in [hyperfine](https://github.com/sharkdp/hyperfine), [ab](https://httpd.apache.org/docs/2.4/programs/ab.html), [wrk](https://github.com/wg/wrk))
-- **Persistent organized results** - Named groups with timestamps, not one-off stdout
-- **Context tracking** - `--message` flag documents what changed between runs
-- **Human-first CLI** - Follows [clig.dev](https://clig.dev) best practices
-
-#### What bench captures
-
-- **Timing**: mean, median, stddev, min, max, p95, p99 (milliseconds)
-- **Per-run data**: duration, exit code, timestamps, stdout/stderr byte counts
-- **Server metrics** (with `--pid`/`--port`): CPU%, memory MB, leak detection
-
-#### AI/LLM-friendly output
-
-bench outputs structured JSON designed for automated analysis:
-
-```json
-{
-  "schema_version": "1.0",
-  "timing": { "mean": 67.70, "p95": 81.00, "stddev": 16.22, ... },
-  "runs": [
-    { "run_number": 1, "duration_ms": 72.47, "exit_code": 0, ... },
-    ...
-  ],
-  "server": { "memory": { "initial": 45.2, "final": 47.8, "delta": 2.6 }, ... }
-}
-```
-
-Feed directly to Claude, GPT, or scripts for trend analysis, anomaly detection, or optimization suggestions.
-
-#### Use cases
-
-| Scenario | Without bench | With bench |
-|----------|---------------|------------|
-| "How fast is this command?" | `time` gives one sample | Stats across N runs + JSON |
-| "Is my server leaking memory?" | Watch `htop` manually | `--pid` tracks delta automatically |
-| "Compare before/after optimization" | Copy/paste somewhere | Named groups organize experiments |
-| "Analyze with AI" | Screenshot terminal | Structured JSON, paste and ask |
-
-#### Works with any command
+**bench doesn't replace** specialized tools - wrap them to add server monitoring:
 
 ```bash
-# Build tools
-bench --runs 5 "make clean && make"
-
-# Database queries
-bench --runs 20 "psql -c 'SELECT count(*) FROM users'"
-
-# File operations
-bench --runs 50 "find . -name '*.log' | wc -l"
-
-# Scripts
-bench --runs 10 "python process_data.py"
-
-# With server monitoring
-bench --runs 30 --pid $SERVER_PID "curl -s localhost:8080/api"
+bench --port 8080 "hyperfine 'curl localhost:8080'"
+bench --port 8080 "k6 run load-test.js"
 ```
-
-#### Complements specialized tools
-
-| Tool | What it does | What bench adds |
-|------|--------------|-----------------|
-| [hyperfine](https://github.com/sharkdp/hyperfine) | Statistical CLI comparison | Server monitoring + persistent logs |
-| [ab](https://httpd.apache.org/docs/2.4/programs/ab.html) / [wrk](https://github.com/wg/wrk) | HTTP load generation | CPU/memory tracking during load |
-| [k6](https://github.com/grafana/k6) | Scriptable load testing | Server-side metrics + organized logs |
-| [time](https://man7.org/linux/man-pages/man1/time.1.html) | Single command timing | N runs + statistics + JSON |
 
 ## Installation
 
+:one: Clone the repository
+
 ```bash
-# Clone repository
 git clone https://github.com/KakkoiDev/bench.git
 cd bench
+```
 
-# Make executable
+:two: Make `bench` executable and symlink to PATH
+
+```bash
 chmod +x bench
-
-# Optional: Add to PATH
 sudo ln -s "$(pwd)/bench" /usr/local/bin/bench
 ```
 
-### Requirements
+## Usage
 
-**Core dependencies** (required):
-- **Perl 5.8+** with Time::HiRes module (usually pre-installed)
-- **bc** command for floating-point calculations
-
-**Server monitoring** (optional, only if using --pid or --port):
-- **top** command for process monitoring
-- **lsof** or **ss** for port-to-PID resolution
+**Basic timing:**
 
 ```bash
-# Debian/Ubuntu
-sudo apt-get install perl bc procps lsof
-
-# RHEL/Fedora
-sudo dnf install perl bc procps-ng lsof
-
-# macOS
-brew install perl bc
-# top and lsof pre-installed on macOS
+bench "echo hello world"
 ```
 
-## Usage
+**Server monitoring:**
+
+```bash
+# Start a test server
+python3 -m http.server 8080 &
+
+# Benchmark with CPU/memory tracking
+bench --runs 20 --port 8080 "curl -s localhost:8080"
+```
+
+**Track optimization iterations:**
+
+```bash
+# Baseline
+bench --name "api" --message "baseline" --runs 100 --port 8080 "curl -s localhost:8080/export"
+
+# After adding cache
+bench --name "api" --message "with cache" --runs 100 --port 8080 "curl -s localhost:8080/export"
+
+# Compare
+jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
+```
+
+### Options
 
 ```
 bench [OPTIONS] COMMAND
 
 Options:
   --runs N          Number of runs (default: 10)
-  --name NAME       Named group (optional, auto-generated from command if omitted)
-  --message TEXT    Message describing this run (optional)
-  --quiet           No progress output
-
-  --pid PID         Monitor process by PID
-  --port PORT       Monitor process by port
-
+  --name NAME       Named group for organizing results
+  --message TEXT    Describe what changed (e.g., "baseline", "with cache")
+  --quiet           Suppress progress output, only print results path
+  --pid PID         Monitor process CPU/memory by PID
+  --port PORT       Monitor process by port (auto-resolves PID)
   --help            Show help
   --version         Show version
 ```
 
-### Exit Codes
+### Output
 
-- **0**: Success (even with partial results or failed runs)
-- **1**: Pre-flight validation failed (missing deps, disk full, invalid input)
-- **130**: User interruption (SIGINT/Ctrl+C)
+Results saved to `./bench-results/`:
 
-## Output
-
-**Directory structure**:
 ```
 ./bench-results/
-  api-v1/                       # Named group
-    20250123-143052-12345/      # Timestamp-PID
-      benchmark.json            # All metrics (machine-readable)
-      runs/                     # Individual run outputs
-        1.log
+  api/                            # --name group
+    20250130-143052-12345/        # timestamp-pid
+      benchmark.json              # all metrics
+      runs/
+        1.log                     # stdout/stderr per run
         2.log
         ...
 ```
 
-**benchmark.json** contains:
-- Timing metrics: mean, median, stddev, min, max, p95, p99 (milliseconds)
-- Success/failure tracking: runs_total, runs_successful, runs_failed, success_rate
-- Server metrics (if --pid/--port): CPU (percent), memory (megabytes)
-- Per-run data: exit codes, timestamps, timing breakdown, output sizes
-- Environment metadata: os, shell, pwd, git commit
-- Interruption tracking: partial results if Ctrl+C
+**benchmark.json:**
 
-**stdout** outputs absolute path to results directory for piping:
-```bash
-RESULTS=$(bench --quiet --runs 10 "echo test")
-cat "$RESULTS/benchmark.json" | jq .timing.mean
+```json
+{
+  "schema_version": "1.0",
+  "name": "api",
+  "message": "baseline",
+  "command": "curl -s localhost:8080",
+  "timing": {
+    "unit": "milliseconds",
+    "mean": 23.4,
+    "median": 21.0,
+    "stddev": 8.7,
+    "min": 12.5,
+    "max": 45.2,
+    "p95": 38.1,
+    "p99": 44.0
+  },
+  "server": {
+    "pid": 12345,
+    "cpu": { "mean": 15.2, "min": 10.1, "max": 22.3 },
+    "memory": { "initial": 45.0, "final": 47.8, "delta": 2.8, "mean": 46.2 }
+  },
+  "runs": [{ "run_number": 1, "duration_ms": 23.4, "exit_code": 0 }],
+  "environment": { "os": "Linux", "shell": "/bin/bash" }
+}
 ```
 
-## Examples
+## With other tools
 
-### Analysis with jq
+**Compare runs with [jq](https://jqlang.github.io/jq/):**
 
 ```bash
-# Quick summary
-jq -r '"Mean: \(.timing.mean)ms"' benchmark.json
-
-# Compare multiple runs
-jq -r '"\(.message): \(.timing.mean)ms"' \
-  bench-results/api-v1/*/benchmark.json
-
-# Server CPU usage
-jq -r '"\(.message): \(.server.cpu.mean)%"' \
-  bench-results/api-v1/*/benchmark.json
+jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
 ```
 
-### Analysis with LLM
+**Analyze with [Claude](https://github.com/anthropics/claude-code):**
 
 ```bash
-# Analyze performance trends
-cat bench-results/api-v1/*/benchmark.json | llm \
-  "Compare all runs. How did performance improve?"
-
-# Memory leak detection
-cat benchmark.json | llm \
-  "Analyze memory delta. Is there a leak?"
+cat bench-results/api/*/benchmark.json | claude "compare these runs, identify bottlenecks"
 ```
 
-### Iterative optimization
+**Stress test with xargs:**
 
 ```bash
-# Baseline
-bench --name "api-v1" --message "baseline" --pid 12345 "curl localhost/api"
-
-# After Redis caching
-bench --name "api-v1" --message "Redis caching" --pid 12345 "curl localhost/api"
-
-# After query optimization
-bench --name "api-v1" --message "optimized queries" --pid 12345 "curl localhost/api"
-
-# Compare all iterations
-jq -r '"\(.message): \(.timing.mean)ms (CPU: \(.server.cpu.mean)%)"' \
-  bench-results/api-v1/*/benchmark.json
+bench --name "stress" --port 8080 \
+  "seq 100 | xargs -P 100 -I {} curl -s localhost:8080"
 ```
 
-### Using bench WITH other tools
+<details>
+<summary><strong>With hyperfine, k6, ab, wrk</strong></summary>
 
-**With [hyperfine](https://github.com/sharkdp/hyperfine)** (statistical command comparison):
+bench wraps other benchmarking tools to add server monitoring:
+
 ```bash
-# hyperfine provides statistical rigor, bench adds server monitoring
-bench --name "query-perf" --message "baseline" --pid 12345 \
+# hyperfine for statistical rigor + bench for server stats
+bench --name "query" --port 5432 \
   "hyperfine --warmup 3 'psql -c \"SELECT * FROM users\"'"
 
-# Get hyperfine's detailed stats (in run logs) + server CPU/memory tracking
-```
-
-**With [ab](https://httpd.apache.org/docs/2.4/programs/ab.html)/[wrk](https://github.com/wg/wrk)** (HTTP load testing):
-```bash
-# ab provides HTTP-specific metrics, bench adds server resource tracking
-bench --name "load-test" --message "100 concurrent" --pid 12345 \
-  "ab -n 1000 -c 100 http://localhost/api"
-
-# Get ab's throughput/latency metrics + server CPU/memory under load
-```
-
-**With [k6](https://github.com/grafana/k6)** (complex load testing):
-```bash
-# k6 handles complex scenarios, bench tracks server resources over time
-bench --name "checkout-flow" --message "v1.0" --pid 12345 \
+# k6 for load testing + bench for server stats
+bench --name "checkout" --port 8080 \
   "k6 run --quiet checkout.js"
 
-# k6's detailed metrics (in logs) + server resource consumption tracked
+# ab for HTTP load + bench for server stats
+bench --name "load" --port 8080 \
+  "ab -n 1000 -c 100 http://localhost:8080/"
 ```
 
-**Standalone** (general commands):
-```bash
-# For any command where you need timing + server metrics
-bench --name "data-pipeline" --message "1000 records" --pid 12345 \
-  "./process_data.sh --batch-size 1000"
-
-# 100 concurrent requests with xargs
-bench --name "stress-test" --pid 12345 \
-  "seq 100 | xargs -P 100 -I {} curl -s localhost"
-```
-
-## Features
-
-### Auto-naming
-
-If `--name` not provided, generates from command:
-- `curl localhost:8080/api` → `curl-localhost-8080-api`
-- `echo "hello world"` → `echo-hello-world`
-
-### Server monitoring
-
-Track CPU and memory of your application during benchmark:
-```bash
-# Start server
-python3 -m http.server 8080 & SERVER_PID=$!
-
-# Benchmark with monitoring
-bench --pid $SERVER_PID --runs 20 "curl localhost:8080"
-
-# Results include server.cpu and server.memory metrics
-```
-
-### Interruption handling
-
-Press Ctrl+C to save partial results:
-- Saves completed runs immediately
-- JSON includes `interrupted: true` and `interrupted_at_run`
-- Exit code 130 (standard SIGINT)
-
-### Failure tracking
-
-Continues all runs even if command fails:
-- Tracks success/failure counts
-- Per-run exit codes in JSON
-- Useful for testing flaky services
-
-## Design Philosophy
-
-See [PHILOSOPHY.md](PHILOSOPHY.md) for detailed design decisions.
-
-**TL;DR**: POSIX shell, JSON-only output, long flags only, millisecond precision, Unix tools.
-
-## Development
-
-See [DEVELOPMENT.md](DEVELOPMENT.md) for testing, development dependencies, and demo recording instructions.
+</details>
 
 ## Contributing
 
-Contributions welcome! Please see [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+```bash
+# Development
+./bench --runs 5 "echo test"
+
+# Run tests (requires BATS)
+bats tests/
+```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for guidelines.
+
+## Philosophy
+
+- **Composable.** Works with any command, wraps existing tools.
+- **Portable.** POSIX shell, runs anywhere.
+- **Persistent.** Organized logs you can revisit and compare.
+- **AI-friendly.** Structured JSON for LLM analysis.
+
+## Resources
+
+- [Command Line Interface Guidelines](https://clig.dev)
 
 ## License
 
-MIT License - See [LICENSE](LICENSE) file for details.
+[MIT License](LICENSE)
