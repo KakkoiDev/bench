@@ -236,7 +236,7 @@ Options:
 **stdout** outputs absolute path to results directory for piping:
 ```bash
 RESULTS=$(bench --quiet --runs 10 "echo test")
-cat "$RESULTS/benchmark.json" | jq .benchmark.timing.mean
+cat "$RESULTS/benchmark.json" | jq .timing.mean
 ```
 
 ## Examples
@@ -245,14 +245,14 @@ cat "$RESULTS/benchmark.json" | jq .benchmark.timing.mean
 
 ```bash
 # Quick summary
-jq -r '"Mean: \(.benchmark.timing.mean)ms"' benchmark.json
+jq -r '"Mean: \(.timing.mean)ms"' benchmark.json
 
 # Compare multiple runs
-jq -r '"\(.benchmark.message): \(.benchmark.timing.mean)ms"' \
+jq -r '"\(.message): \(.timing.mean)ms"' \
   bench-results/api-v1/*/benchmark.json
 
 # Server CPU usage
-jq -r '"\(.benchmark.message): \(.benchmark.server.cpu.mean)%"' \
+jq -r '"\(.message): \(.server.cpu.mean)%"' \
   bench-results/api-v1/*/benchmark.json
 ```
 
@@ -281,7 +281,7 @@ bench --name "api-v1" --message "Redis caching" --pid 12345 "curl localhost/api"
 bench --name "api-v1" --message "optimized queries" --pid 12345 "curl localhost/api"
 
 # Compare all iterations
-jq -r '"\(.benchmark.message): \(.benchmark.timing.mean)ms (CPU: \(.benchmark.server.cpu.mean)%)"' \
+jq -r '"\(.message): \(.timing.mean)ms (CPU: \(.server.cpu.mean)%)"' \
   bench-results/api-v1/*/benchmark.json
 ```
 
