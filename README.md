@@ -127,10 +127,10 @@ Results saved to `./bench-results/`:
 jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
 ```
 
-**Analyze with [Claude](https://github.com/anthropics/claude-code):**
+**Analyze with [Claude Code](https://github.com/anthropics/claude-code):**
 
 ```bash
-cat bench-results/api/*/benchmark.json | claude "compare these runs, identify bottlenecks"
+claude -p "$(cat bench-results/api/*/benchmark.json) compare these runs, identify bottlenecks"
 ```
 
 **Stress test with [xargs](https://man7.org/linux/man-pages/man1/xargs.1.html):**
@@ -139,27 +139,6 @@ cat bench-results/api/*/benchmark.json | claude "compare these runs, identify bo
 bench --name "stress" --port 8080 \
   "seq 100 | xargs -P 100 -I {} curl -s localhost:8080"
 ```
-
-<details>
-<summary><strong>With hyperfine, k6, ab, wrk</strong></summary>
-
-bench wraps other benchmarking tools to add server monitoring:
-
-```bash
-# hyperfine for statistical rigor + bench for server stats
-bench --name "query" --port 5432 \
-  "hyperfine --warmup 3 'psql -c \"SELECT * FROM users\"'"
-
-# k6 for load testing + bench for server stats
-bench --name "checkout" --port 8080 \
-  "k6 run --quiet checkout.js"
-
-# ab for HTTP load + bench for server stats
-bench --name "load" --port 8080 \
-  "ab -n 1000 -c 100 http://localhost:8080/"
-```
-
-</details>
 
 ## Contributing
 
