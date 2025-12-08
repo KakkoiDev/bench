@@ -2,7 +2,7 @@
 
 Simple command timing + server monitoring + AI-friendly persistent logs.
 
-https://github.com/user-attachments/assets/50bbcdeb-6e21-43a8-a898-fdbb0045ebb2
+[![asciicast](https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N.svg)](https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N)
 
 ## Why bench?
 
