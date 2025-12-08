@@ -60,6 +60,17 @@ bench --name "api" --message "with cache" --runs 100 --port 8080 "curl -s localh
 jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
 ```
 
+**Scripting with --quiet:**
+
+```bash
+# --quiet suppresses progress, outputs only the results path
+RESULTS=$(bench --quiet --runs 10 "curl -s localhost:8080")
+jq .timing "$RESULTS/benchmark.json"
+
+# One-liner
+jq .timing "$(bench --quiet --runs 5 "echo test")/benchmark.json"
+```
+
 ### Options
 
 ```
