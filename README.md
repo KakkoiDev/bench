@@ -2,7 +2,7 @@
 
 Simple command timing + server monitoring + AI-friendly persistent logs.
 
-[![asciicast](https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N.svg)](https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N)
+<a href="https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N"><img src="https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N.svg" width="600"/></a>
 
 ## Why bench?
 
