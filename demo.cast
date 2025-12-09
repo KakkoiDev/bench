@@ -18,6 +18,5 @@
 [6.0, "o", "\r  Run 5/5"]
 [6.3, "o", "\r\n/tmp/bench-results/api/20251208-090751-11729\r\n"]
 [7.0, "o", "$ # ai analysis\r\n"]
-[7.5, "o", "$ claude -p \"$(cat bench-results/api/*/benchmark.json) compare these runs, what improved?\"\r\n"]
+[7.5, "o", "$ claude --print \"$(cat bench-results/api/*/benchmark.json) compare these runs, what improved?\"\r\n"]
 [9.0, "o", "## Benchmark Comparison: baseline vs with cache\r\n\r\n| Metric | Baseline | With Cache | Change |\r\n|--------|----------|------------|--------|\r\n| **Mean** | 71.15 ms | 71.62 ms | +0.47 ms (+0.7%) |\r\n| **Median** | 62.77 ms | 63.49 ms | +0.72 ms (+1.1%) |\r\n| **Min** | 61.48 ms | 61.95 ms | +0.47 ms (+0.8%) |\r\n| **Max** | 105.41 ms | 101.80 ms | **-3.61 ms (-3.4%)** |\r\n| **Stddev** | 19.17 ms | 17.01 ms | **-2.16 ms (-11.3%)** |\r\n| **Memory delta** | 0.01 MB | 0.00 MB | -0.01 MB |\r\n\r\n### What improved:\r\n- **Reduced variance**: Stddev dropped 11.3%, more consistent response times\r\n- **Lower max latency**: Worst-case dropped from 105.4 ms to 101.8 ms\r\n- **Stable memory**: No memory growth with cache\r\n\r\n### Conclusion:\r\nThe cache provides **more consistent performance** (lower variance) but doesn't improve average speed.\r\n"]
-[11.0, "o", "$ "]

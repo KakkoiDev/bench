@@ -2,7 +2,7 @@
 
 Simple command timing + server monitoring + AI-friendly persistent logs.
 
-<a href="https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N"><img src="https://asciinema.org/a/Ni0cn2lTaZlxYggIA1fZpSX0N.svg" width="600"/></a>
+<a href="https://asciinema.org/a/eQeiWHV3Eip4VkLDAp6SWsflt"><img src="https://asciinema.org/a/eQeiWHV3Eip4VkLDAp6SWsflt.svg" width="600"/></a>
 
 ## Why bench?
 
@@ -141,7 +141,7 @@ jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
 **Analyze with [Claude Code](https://github.com/anthropics/claude-code):**
 
 ```bash
-claude -p "$(cat bench-results/api/*/benchmark.json) compare these runs, identify bottlenecks"
+claude --print "$(cat bench-results/api/*/benchmark.json) compare these runs, identify bottlenecks"
 ```
 
 **Stress test with [xargs](https://man7.org/linux/man-pages/man1/xargs.1.html):**
