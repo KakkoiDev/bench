@@ -179,6 +179,180 @@ load helpers
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
 
-  # Server section should NOT be present
+  # Server/processes section should NOT be present
   ! grep -q '"server":' "$json_file"
+  ! grep -q '"processes":' "$json_file"
+}
+
+# =============================================================================
+# Multi-Process Monitoring Tests (Schema 2.0)
+# =============================================================================
+
+@test "multiple --pid flags are accepted" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid1=$!
+  sleep 60 &
+  pid2=$!
+
+  run_bench --runs 1 --quiet --pid "$pid1" --pid "$pid2" "echo test"
+  [ "$status" -eq 0 ]
+
+  kill "$pid1" "$pid2" 2>/dev/null || true
+}
+
+@test "--pid accepts name:pid format" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid=$!
+
+  run_bench --runs 1 --quiet --pid "myapp:$pid" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  grep -q '"name": "myapp"' "$json_file" || grep -q '"name":"myapp"' "$json_file"
+
+  kill "$pid" 2>/dev/null || true
+}
+
+@test "processes array contains all monitored processes" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid1=$!
+  sleep 60 &
+  pid2=$!
+
+  run_bench --runs 2 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  [ "$(jq '.processes | length' "$json_file")" -eq 2 ]
+  [ "$(jq '.processes[0].name' "$json_file")" = '"app"' ]
+  [ "$(jq '.processes[1].name' "$json_file")" = '"redis"' ]
+
+  kill "$pid1" "$pid2" 2>/dev/null || true
+}
+
+@test "per-run processes keyed by name" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid1=$!
+  sleep 60 &
+  pid2=$!
+
+  run_bench --runs 1 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  jq -e '.runs[0].processes.app' "$json_file"
+  jq -e '.runs[0].processes.redis' "$json_file"
+
+  kill "$pid1" "$pid2" 2>/dev/null || true
+}
+
+@test "metrics files created for each process" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid1=$!
+  sleep 60 &
+  pid2=$!
+
+  run_bench --runs 2 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
+  [ "$status" -eq 0 ]
+
+  output_dir=$(find "$TEST_TEMP_DIR/bench-results" -type d -name "2*" | head -1)
+  [ -f "$output_dir/runs/1.app.metrics" ]
+  [ -f "$output_dir/runs/1.redis.metrics" ]
+  [ -f "$output_dir/runs/2.app.metrics" ]
+  [ -f "$output_dir/runs/2.redis.metrics" ]
+
+  kill "$pid1" "$pid2" 2>/dev/null || true
+}
+
+@test "auto-detects process name when not provided" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid=$!
+
+  run_bench --runs 1 --quiet --pid "$pid" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  grep -q '"name": "sleep"' "$json_file" || grep -q '"name":"sleep"' "$json_file"
+
+  kill "$pid" 2>/dev/null || true
+}
+
+@test "mixed --pid and --port flags work together" {
+  require_command python3
+
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid=$!
+  server_pid=$(create_real_server)
+  sleep 0.3
+  port=$(get_server_port "$server_pid")
+
+  run_bench --runs 1 --quiet --pid "worker:$pid" --port "api:$port" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  [ "$(jq '.processes | length' "$json_file")" -eq 2 ]
+
+  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$server_pid"
+}
+
+@test "duplicate process names produce error" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid1=$!
+  sleep 60 &
+  pid2=$!
+
+  run_bench --runs 1 --quiet --pid "app:$pid1" --pid "app:$pid2" "echo test"
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "Duplicate process name" ]]
+
+  kill "$pid1" "$pid2" 2>/dev/null || true
+}
+
+@test "--port accepts name:port format" {
+  require_command python3
+
+  cd "$TEST_TEMP_DIR"
+  server_pid=$(create_real_server)
+  sleep 0.3
+  port=$(get_server_port "$server_pid")
+
+  run_bench --runs 1 --quiet --port "api:$port" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  grep -q '"name": "api"' "$json_file" || grep -q '"name":"api"' "$json_file"
+
+  kill_mock_process "$server_pid"
+}
+
+@test "schema version is 2.0 when using multi-process monitoring" {
+  cd "$TEST_TEMP_DIR"
+
+  sleep 60 &
+  pid=$!
+
+  run_bench --runs 1 --quiet --pid "app:$pid" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  [ "$(jq -r '.schema_version' "$json_file")" = "2.0" ]
+
+  kill "$pid" 2>/dev/null || true
 }
