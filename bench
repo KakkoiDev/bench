@@ -32,26 +32,28 @@ Usage: bench [OPTIONS] COMMAND
 Minimal benchmarking CLI - Run commands multiple times and capture structured data.
 
 Options:
-  --runs N          Number of runs (default: 10)
-  --name NAME       Named group for organizing results
-  --message TEXT    Describe what changed (e.g., "baseline", "with cache")
-  --quiet           Suppress progress output, only print results path
+  --runs N            Number of runs (default: 10)
+  --name NAME         Named group for organizing results
+  --message TEXT      Describe what changed (e.g., "baseline", "with cache")
+  --quiet             Suppress progress output, only print results path
 
-  --pid PID         Monitor process CPU/memory by PID
-  --port PORT       Monitor process by port (auto-resolves PID)
+  --pid [NAME:]PID    Monitor process CPU/memory by PID (repeatable)
+  --port [NAME:]PORT  Monitor process by port (repeatable)
 
-  --help            Show help
-  --version         Show version
+  --help              Show help
+  --version           Show version
 
 Examples:
   bench --runs 10 "curl localhost:8080"
   bench --runs 20 --name "api-v1" --message "baseline" "curl localhost/api"
-  bench --runs 50 --pid 12345 "curl localhost:8080"
+  bench --pid 12345 --pid 67890 "curl localhost:8080"
+  bench --pid app:12345 --port redis:6379 "curl localhost:8080"
 
 Output:
   Results saved to: ./bench-results/<name>/<timestamp-pid>/
     - benchmark.json (all metrics)
-    - runs/*.log (individual run outputs)
+    - runs/*.log (command stdout/stderr per run)
+    - runs/*.<process>.metrics (CPU/memory readings per process)
 
 More info:
   https://github.com/KakkoiDev/bench
