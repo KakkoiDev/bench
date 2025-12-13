@@ -82,12 +82,15 @@ require_command() {
 # Helper: Create lightweight mock process for infrastructure testing
 # This process consumes minimal resources (CPU ~0%, memory ~100KB)
 # Use for unit tests that just need a valid PID to monitor
-# Usage: pid=$(create_mock_process)      # default 10s
-#        pid=$(create_mock_process 1)    # 1s for fast tests
+# Sets MOCK_PID variable (avoids subshell issues with command substitution)
+# Usage: create_mock_process        # default 10s, PID in $MOCK_PID
+#        create_mock_process 60     # 60s duration
+#        create_mock_process 60 WORKER_PID  # custom variable name
 create_mock_process() {
   local duration="${1:-10}"
+  local varname="${2:-MOCK_PID}"
   sleep "$duration" &
-  echo $!
+  eval "$varname=\$!"
 }
 
 # Helper: Create realistic server for integration testing

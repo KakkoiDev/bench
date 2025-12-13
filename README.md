@@ -87,23 +87,17 @@ Options:
   --version           Show version
 ```
 
+Note: Process names cannot contain colons (`:` is the delimiter).
+
 ### Output
 
-Results saved to `./bench-results/`:
+Results saved to `./bench-results/<name>/<timestamp>/`:
 
 ```
-./bench-results/
-  api/                            # --name group
-    20250130-143052-12345/        # timestamp-pid
-      benchmark.json              # all metrics
-      runs/
-        1.log                     # stdout/stderr for run 1
-        1.app.metrics             # CPU/memory readings for "app" process
-        1.redis.metrics           # CPU/memory readings for "redis" process
-        2.log
-        2.app.metrics
-        2.redis.metrics
-        ...
+benchmark.json        # all metrics
+runs/
+  1.log               # stdout/stderr per run
+  1.app.metrics       # CPU/memory per process (when using --pid/--port)
 ```
 
 **benchmark.json:**
@@ -114,42 +108,11 @@ Results saved to `./bench-results/`:
   "name": "api",
   "message": "baseline",
   "command": "curl -s localhost:8080",
-  "timing": {
-    "unit": "milliseconds",
-    "mean": 23.4,
-    "median": 21.0,
-    "stddev": 8.7,
-    "min": 12.5,
-    "max": 45.2,
-    "p95": 38.1,
-    "p99": 44.0
-  },
+  "timing": { "mean": 23.4, "median": 21.0, "min": 12.5, "max": 45.2, "p95": 38.1, "p99": 44.0 },
   "processes": [
-    {
-      "name": "app",
-      "pid": 12345,
-      "port": 8080,
-      "cpu": { "unit": "percent", "mean": 15.2, "min": 10.1, "max": 22.3 },
-      "memory": { "unit": "megabytes", "mean": 46.2, "min": 45.0, "max": 47.8, "initial": 45.0, "final": 47.8, "delta": 2.8 }
-    },
-    {
-      "name": "redis",
-      "pid": 12346,
-      "cpu": { "unit": "percent", "mean": 2.1, "min": 1.0, "max": 4.5 },
-      "memory": { "unit": "megabytes", "mean": 12.2, "min": 11.8, "max": 12.5, "initial": 11.8, "final": 12.5, "delta": 0.7 }
-    }
+    { "name": "app", "pid": 12345, "cpu": { "mean": 15.2 }, "memory": { "mean": 46.2, "delta": 2.8 } }
   ],
-  "runs": [
-    {
-      "run_number": 1,
-      "duration_ms": 23.4,
-      "exit_code": 0,
-      "processes": {
-        "app": { "cpu_percent": 15.2, "memory_mb": 45.0 },
-        "redis": { "cpu_percent": 2.1, "memory_mb": 12.0 }
-      }
-    }
-  ],
+  "runs": [{ "run_number": 1, "duration_ms": 23.4, "exit_code": 0 }],
   "environment": { "os": "Linux", "shell": "/bin/bash" }
 }
 ```
@@ -175,28 +138,17 @@ bench --name "stress" --port 8080 \
   "seq 100 | xargs -P 100 -I {} curl -s localhost:8080"
 ```
 
-## Monitoring Docker Compose Services
-
-Monitor your app server alongside backend services:
+**Monitor [Docker Compose](https://docs.docker.com/compose/) services:**
 
 ```bash
 # Get container PIDs
 APP_PID=$(docker inspect --format '{{.State.Pid}}' myapp_app_1)
 REDIS_PID=$(docker inspect --format '{{.State.Pid}}' myapp_redis_1)
-POSTGRES_PID=$(docker inspect --format '{{.State.Pid}}' myapp_postgres_1)
 
 # Benchmark with multi-process monitoring
 bench --runs 20 \
   --pid "app:$APP_PID" \
   --pid "redis:$REDIS_PID" \
-  --pid "postgres:$POSTGRES_PID" \
-  "curl -s localhost:5000/api/data"
-
-# Or use ports (auto-resolves PIDs)
-bench --runs 20 \
-  --port "app:5000" \
-  --port "redis:6379" \
-  --port "postgres:5432" \
   "curl -s localhost:5000/api/data"
 ```
 

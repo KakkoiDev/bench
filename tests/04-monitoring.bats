@@ -6,14 +6,12 @@ load helpers
 @test "--pid accepts valid PID" {
   cd "$TEST_TEMP_DIR"
 
-  # Start process directly (not in subshell) to avoid early termination
-  sleep 60 &
-  pid=$!
+  create_mock_process 60
 
-  run_bench --runs 1 --quiet --pid "$pid" "echo test"
+  run_bench --runs 1 --quiet --pid "$MOCK_PID" "echo test"
   [ "$status" -eq 0 ]
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$MOCK_PID"
 }
 
 @test "--pid validates numeric argument" {
@@ -49,18 +47,10 @@ load helpers
 @test "process metrics included in JSON when --pid used" {
   cd "$TEST_TEMP_DIR"
 
-  # Start process directly (not in subshell) to avoid early termination
-  sleep 60 &
-  pid=$!
-
-  # Give process time to start
-  sleep 0.1
-
-  # Verify process exists
-  kill -0 "$pid" 2>/dev/null || { echo "Process $pid doesn't exist"; return 1; }
+  create_mock_process 60
 
   # Run directly to avoid any run wrapper issues
-  "$BENCH_SCRIPT" --runs 2 --quiet --pid "$pid" "echo test"
+  "$BENCH_SCRIPT" --runs 2 --quiet --pid "$MOCK_PID" "echo test"
   bench_status=$?
   [ "$bench_status" -eq 0 ]
 
@@ -72,7 +62,7 @@ load helpers
   grep -q '"cpu":' "$json_file"
   grep -q '"memory":' "$json_file"
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$MOCK_PID"
 }
 
 @test "process metrics included in JSON when --port used" {
@@ -191,39 +181,35 @@ load helpers
 @test "multiple --pid flags are accepted" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid1=$!
-  sleep 60 &
-  pid2=$!
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
 
   run_bench --runs 1 --quiet --pid "$pid1" --pid "$pid2" "echo test"
   [ "$status" -eq 0 ]
 
-  kill "$pid1" "$pid2" 2>/dev/null || true
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "--pid accepts name:pid format" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid=$!
+  create_mock_process 60
 
-  run_bench --runs 1 --quiet --pid "myapp:$pid" "echo test"
+  run_bench --runs 1 --quiet --pid "myapp:$MOCK_PID" "echo test"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
   grep -q '"name": "myapp"' "$json_file" || grep -q '"name":"myapp"' "$json_file"
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$MOCK_PID"
 }
 
 @test "processes array contains all monitored processes" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid1=$!
-  sleep 60 &
-  pid2=$!
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
 
   run_bench --runs 2 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
   [ "$status" -eq 0 ]
@@ -233,16 +219,15 @@ load helpers
   [ "$(jq '.processes[0].name' "$json_file")" = '"app"' ]
   [ "$(jq '.processes[1].name' "$json_file")" = '"redis"' ]
 
-  kill "$pid1" "$pid2" 2>/dev/null || true
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "per-run processes keyed by name" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid1=$!
-  sleep 60 &
-  pid2=$!
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
 
   run_bench --runs 1 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
   [ "$status" -eq 0 ]
@@ -251,16 +236,15 @@ load helpers
   jq -e '.runs[0].processes.app' "$json_file"
   jq -e '.runs[0].processes.redis' "$json_file"
 
-  kill "$pid1" "$pid2" 2>/dev/null || true
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "metrics files created for each process" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid1=$!
-  sleep 60 &
-  pid2=$!
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
 
   run_bench --runs 2 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
   [ "$status" -eq 0 ]
@@ -271,22 +255,44 @@ load helpers
   [ -f "$output_dir/runs/2.app.metrics" ]
   [ -f "$output_dir/runs/2.redis.metrics" ]
 
-  kill "$pid1" "$pid2" 2>/dev/null || true
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "auto-detects process name when not provided" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid=$!
+  # create_mock_process uses sleep, so ps will show "sleep" as process name
+  create_mock_process 60
 
-  run_bench --runs 1 --quiet --pid "$pid" "echo test"
+  run_bench --runs 1 --quiet --pid "$MOCK_PID" "echo test"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
   grep -q '"name": "sleep"' "$json_file" || grep -q '"name":"sleep"' "$json_file"
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$MOCK_PID"
+}
+
+@test "auto-detected duplicate names get suffix" {
+  cd "$TEST_TEMP_DIR"
+
+  # Start two sleep processes (same command name)
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
+
+  run_bench --runs 1 --quiet --pid "$pid1" --pid "$pid2" "echo test"
+  [ "$status" -eq 0 ]
+
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+
+  # First should be "sleep", second should be "sleep-2"
+  [ "$(jq '.processes | length' "$json_file")" -eq 2 ]
+  [ "$(jq -r '.processes[0].name' "$json_file")" = "sleep" ]
+  [ "$(jq -r '.processes[1].name' "$json_file")" = "sleep-2" ]
+
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "mixed --pid and --port flags work together" {
@@ -294,35 +300,34 @@ load helpers
 
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid=$!
+  create_mock_process 60
+  worker_pid=$MOCK_PID
   server_pid=$(create_real_server)
   sleep 0.3
   port=$(get_server_port "$server_pid")
 
-  run_bench --runs 1 --quiet --pid "worker:$pid" --port "api:$port" "echo test"
+  run_bench --runs 1 --quiet --pid "worker:$worker_pid" --port "api:$port" "echo test"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
   [ "$(jq '.processes | length' "$json_file")" -eq 2 ]
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$worker_pid"
   kill_mock_process "$server_pid"
 }
 
 @test "duplicate process names produce error" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid1=$!
-  sleep 60 &
-  pid2=$!
+  create_mock_process 60 pid1
+  create_mock_process 60 pid2
 
   run_bench --runs 1 --quiet --pid "app:$pid1" --pid "app:$pid2" "echo test"
   [ "$status" -eq 1 ]
   [[ "$output" =~ "Duplicate process name" ]]
 
-  kill "$pid1" "$pid2" 2>/dev/null || true
+  kill_mock_process "$pid1"
+  kill_mock_process "$pid2"
 }
 
 @test "--port accepts name:port format" {
@@ -345,14 +350,13 @@ load helpers
 @test "schema version is 2.0 when using multi-process monitoring" {
   cd "$TEST_TEMP_DIR"
 
-  sleep 60 &
-  pid=$!
+  create_mock_process 60
 
-  run_bench --runs 1 --quiet --pid "app:$pid" "echo test"
+  run_bench --runs 1 --quiet --pid "app:$MOCK_PID" "echo test"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
   [ "$(jq -r '.schema_version' "$json_file")" = "2.0" ]
 
-  kill "$pid" 2>/dev/null || true
+  kill_mock_process "$MOCK_PID"
 }
