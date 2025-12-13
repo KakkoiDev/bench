@@ -9,7 +9,7 @@ Simple command timing + server monitoring + AI-friendly persistent logs.
 **The gap:** Existing tools ([time](https://man7.org/linux/man-pages/man1/time.1.html), [hyperfine](https://github.com/sharkdp/hyperfine), [k6](https://github.com/grafana/k6), [ab](https://httpd.apache.org/docs/2.4/programs/ab.html), [wrk](https://github.com/wg/wrk)) don't track server CPU/memory during execution, and most output to stdout only.
 
 **bench adds:**
-- Server CPU/memory monitoring via `--pid` or `--port`
+- Multi-process CPU/memory monitoring via `--pid` or `--port` (repeatable)
 - Persistent, organized JSON logs you can compare across runs
 - AI-friendly output for LLM analysis
 
@@ -77,14 +77,14 @@ jq .timing "$(bench --quiet --runs 5 "echo test")/benchmark.json"
 bench [OPTIONS] COMMAND
 
 Options:
-  --runs N          Number of runs (default: 10)
-  --name NAME       Named group for organizing results
-  --message TEXT    Describe what changed (e.g., "baseline", "with cache")
-  --quiet           Suppress progress output, only print results path
-  --pid PID         Monitor process CPU/memory by PID
-  --port PORT       Monitor process by port (auto-resolves PID)
-  --help            Show help
-  --version         Show version
+  --runs N            Number of runs (default: 10)
+  --name NAME         Named group for organizing results
+  --message TEXT      Describe what changed (e.g., "baseline", "with cache")
+  --quiet             Suppress progress output, only print results path
+  --pid [NAME:]PID    Monitor process CPU/memory by PID (repeatable)
+  --port [NAME:]PORT  Monitor process by port (repeatable)
+  --help              Show help
+  --version           Show version
 ```
 
 ### Output
@@ -97,8 +97,12 @@ Results saved to `./bench-results/`:
     20250130-143052-12345/        # timestamp-pid
       benchmark.json              # all metrics
       runs/
-        1.log                     # stdout/stderr per run
+        1.log                     # stdout/stderr for run 1
+        1.app.metrics             # CPU/memory readings for "app" process
+        1.redis.metrics           # CPU/memory readings for "redis" process
         2.log
+        2.app.metrics
+        2.redis.metrics
         ...
 ```
 
@@ -106,7 +110,7 @@ Results saved to `./bench-results/`:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "2.0",
   "name": "api",
   "message": "baseline",
   "command": "curl -s localhost:8080",
@@ -120,12 +124,32 @@ Results saved to `./bench-results/`:
     "p95": 38.1,
     "p99": 44.0
   },
-  "server": {
-    "pid": 12345,
-    "cpu": { "mean": 15.2, "min": 10.1, "max": 22.3 },
-    "memory": { "initial": 45.0, "final": 47.8, "delta": 2.8, "mean": 46.2 }
-  },
-  "runs": [{ "run_number": 1, "duration_ms": 23.4, "exit_code": 0 }],
+  "processes": [
+    {
+      "name": "app",
+      "pid": 12345,
+      "port": 8080,
+      "cpu": { "unit": "percent", "mean": 15.2, "min": 10.1, "max": 22.3 },
+      "memory": { "unit": "megabytes", "mean": 46.2, "min": 45.0, "max": 47.8, "initial": 45.0, "final": 47.8, "delta": 2.8 }
+    },
+    {
+      "name": "redis",
+      "pid": 12346,
+      "cpu": { "unit": "percent", "mean": 2.1, "min": 1.0, "max": 4.5 },
+      "memory": { "unit": "megabytes", "mean": 12.2, "min": 11.8, "max": 12.5, "initial": 11.8, "final": 12.5, "delta": 0.7 }
+    }
+  ],
+  "runs": [
+    {
+      "run_number": 1,
+      "duration_ms": 23.4,
+      "exit_code": 0,
+      "processes": {
+        "app": { "cpu_percent": 15.2, "memory_mb": 45.0 },
+        "redis": { "cpu_percent": 2.1, "memory_mb": 12.0 }
+      }
+    }
+  ],
   "environment": { "os": "Linux", "shell": "/bin/bash" }
 }
 ```
@@ -149,6 +173,31 @@ claude --print "$(cat bench-results/api/*/benchmark.json) compare these runs, id
 ```bash
 bench --name "stress" --port 8080 \
   "seq 100 | xargs -P 100 -I {} curl -s localhost:8080"
+```
+
+## Monitoring Docker Compose Services
+
+Monitor your app server alongside backend services:
+
+```bash
+# Get container PIDs
+APP_PID=$(docker inspect --format '{{.State.Pid}}' myapp_app_1)
+REDIS_PID=$(docker inspect --format '{{.State.Pid}}' myapp_redis_1)
+POSTGRES_PID=$(docker inspect --format '{{.State.Pid}}' myapp_postgres_1)
+
+# Benchmark with multi-process monitoring
+bench --runs 20 \
+  --pid "app:$APP_PID" \
+  --pid "redis:$REDIS_PID" \
+  --pid "postgres:$POSTGRES_PID" \
+  "curl -s localhost:5000/api/data"
+
+# Or use ports (auto-resolves PIDs)
+bench --runs 20 \
+  --port "app:5000" \
+  --port "redis:6379" \
+  --port "postgres:5432" \
+  "curl -s localhost:5000/api/data"
 ```
 
 ## Contributing
