@@ -240,25 +240,6 @@ load helpers
   kill_mock_process "$pid2"
 }
 
-@test "metrics files created for each process" {
-  cd "$TEST_TEMP_DIR"
-
-  create_mock_process 60 pid1
-  create_mock_process 60 pid2
-
-  run_bench --runs 2 --quiet --pid "app:$pid1" --pid "redis:$pid2" "echo test"
-  [ "$status" -eq 0 ]
-
-  output_dir=$(find "$TEST_TEMP_DIR/bench-results" -type d -name "2*" | head -1)
-  [ -f "$output_dir/runs/1.app.metrics" ]
-  [ -f "$output_dir/runs/1.redis.metrics" ]
-  [ -f "$output_dir/runs/2.app.metrics" ]
-  [ -f "$output_dir/runs/2.redis.metrics" ]
-
-  kill_mock_process "$pid1"
-  kill_mock_process "$pid2"
-}
-
 @test "auto-detects process name when not provided" {
   cd "$TEST_TEMP_DIR"
 

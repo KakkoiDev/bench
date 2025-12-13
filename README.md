@@ -97,7 +97,6 @@ Results saved to `./bench-results/<name>/<timestamp>/`:
 benchmark.json        # all metrics
 runs/
   1.log               # stdout/stderr per run
-  1.app.metrics       # CPU/memory per process (when using --pid/--port)
 ```
 
 **benchmark.json:**
