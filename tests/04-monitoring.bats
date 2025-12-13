@@ -46,7 +46,7 @@ load helpers
   [ "$status" -eq 1 ]
 }
 
-@test "server metrics included in JSON when --pid used" {
+@test "process metrics included in JSON when --pid used" {
   cd "$TEST_TEMP_DIR"
 
   # Start process directly (not in subshell) to avoid early termination
@@ -67,15 +67,15 @@ load helpers
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
   [ -f "$json_file" ] || { echo "No json file found"; return 1; }
 
-  # Server metrics should be present
-  grep -q '"server":' "$json_file"
+  # Process metrics should be present (schema 2.0 uses "processes" array)
+  grep -q '"processes":' "$json_file"
   grep -q '"cpu":' "$json_file"
   grep -q '"memory":' "$json_file"
 
   kill "$pid" 2>/dev/null || true
 }
 
-@test "server metrics included in JSON when --port used" {
+@test "process metrics included in JSON when --port used" {
   require_command python3
 
   cd "$TEST_TEMP_DIR"
@@ -88,8 +88,8 @@ load helpers
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
 
-  # Server metrics should be present
-  grep -q '"server":' "$json_file"
+  # Process metrics should be present (schema 2.0 uses "processes" array)
+  grep -q '"processes":' "$json_file"
 
   kill_mock_process "$pid"
 }

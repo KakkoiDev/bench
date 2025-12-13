@@ -4,8 +4,8 @@
 
 set -e
 
-VERSION="1.0.0"
-SCHEMA_VERSION="1.0"
+VERSION="2.0.0"
+SCHEMA_VERSION="2.0"
 
 # Global state for signal handling
 INTERRUPTED=0
@@ -143,6 +143,17 @@ get_process_stats() {
   fi
 }
 
+# Get process name from ps
+# Returns: process command name or empty if not found
+get_process_name() {
+  pid="$1"
+  if [ -z "$pid" ] || ! kill -0 "$pid" 2>/dev/null; then
+    echo ""
+    return
+  fi
+  ps -p "$pid" -o comm= 2>/dev/null | head -1
+}
+
 # Resolve port to PID using lsof (with timeout to prevent hanging)
 resolve_port_to_pid() {
   port="$1"
@@ -169,8 +180,7 @@ main() {
   NAME=""
   MESSAGE=""
   QUIET=0
-  MONITOR_PID=""
-  MONITOR_PORT=""
+  MONITOR_PROCESSES=""  # Space-separated list of "name:pid:port" entries
   COMMAND=""
 
   # Parse arguments
@@ -245,13 +255,27 @@ main() {
         if [ -z "$1" ]; then
           error "--pid requires an argument"
         fi
-        # Validate numeric
+        # Parse name:pid or just pid format
         case "$1" in
-          ''|*[!0-9]*)
-            error "--pid requires a numeric argument"
+          *:*)
+            # name:pid format
+            proc_name="${1%%:*}"
+            proc_pid="${1#*:}"
+            ;;
+          *)
+            # Just pid, name will be auto-detected later
+            proc_name=""
+            proc_pid="$1"
             ;;
         esac
-        MONITOR_PID="$1"
+        # Validate PID is numeric
+        case "$proc_pid" in
+          ''|*[!0-9]*)
+            error "--pid requires a numeric PID (got: $proc_pid)"
+            ;;
+        esac
+        # Add to monitor list (name:pid:port format, port empty for --pid)
+        MONITOR_PROCESSES="$MONITOR_PROCESSES $proc_name:$proc_pid:"
         shift
         ;;
       --port)
@@ -259,13 +283,32 @@ main() {
         if [ -z "$1" ]; then
           error "--port requires an argument"
         fi
-        # Validate numeric
+        # Parse name:port or just port format
         case "$1" in
-          ''|*[!0-9]*)
-            error "--port requires a numeric argument"
+          *:*)
+            # name:port format
+            proc_name="${1%%:*}"
+            proc_port="${1#*:}"
+            ;;
+          *)
+            # Just port, name will be auto-detected later
+            proc_name=""
+            proc_port="$1"
             ;;
         esac
-        MONITOR_PORT="$1"
+        # Validate port is numeric
+        case "$proc_port" in
+          ''|*[!0-9]*)
+            error "--port requires a numeric port (got: $proc_port)"
+            ;;
+        esac
+        # Resolve port to PID
+        resolved_pid=$(resolve_port_to_pid "$proc_port")
+        if [ -z "$resolved_pid" ]; then
+          error "No process found listening on port $proc_port"
+        fi
+        # Add to monitor list (name:pid:port format)
+        MONITOR_PROCESSES="$MONITOR_PROCESSES $proc_name:$resolved_pid:$proc_port"
         shift
         ;;
       --)
@@ -291,19 +334,50 @@ main() {
   # Check dependencies
   check_dependencies
 
-  # Resolve --port to PID if specified
-  if [ -n "$MONITOR_PORT" ]; then
-    MONITOR_PID=$(resolve_port_to_pid "$MONITOR_PORT")
-    if [ -z "$MONITOR_PID" ]; then
-      error "No process found listening on port $MONITOR_PORT"
-    fi
-  fi
+  # Trim leading space from MONITOR_PROCESSES
+  MONITOR_PROCESSES=$(echo "$MONITOR_PROCESSES" | sed 's/^ *//')
 
-  # Validate PID exists before starting benchmark
-  if [ -n "$MONITOR_PID" ]; then
-    if ! kill -0 "$MONITOR_PID" 2>/dev/null; then
-      error "Process $MONITOR_PID does not exist"
-    fi
+  # Process and validate monitored processes
+  if [ -n "$MONITOR_PROCESSES" ]; then
+    validated_processes=""
+    seen_names=""
+    name_counter=1
+
+    for entry in $MONITOR_PROCESSES; do
+      proc_name="${entry%%:*}"
+      rest="${entry#*:}"
+      proc_pid="${rest%%:*}"
+      proc_port="${rest#*:}"
+
+      # Validate PID exists
+      if ! kill -0 "$proc_pid" 2>/dev/null; then
+        error "Process $proc_pid does not exist"
+      fi
+
+      # Auto-detect name if not provided
+      if [ -z "$proc_name" ]; then
+        proc_name=$(get_process_name "$proc_pid")
+        if [ -z "$proc_name" ]; then
+          proc_name="process-$proc_pid"
+        fi
+        # Handle duplicate auto-detected names by appending suffix
+        base_name="$proc_name"
+        while echo "$seen_names" | grep -qw "$proc_name"; do
+          name_counter=$((name_counter + 1))
+          proc_name="${base_name}-${name_counter}"
+        done
+      else
+        # Check for duplicate user-provided names
+        if echo "$seen_names" | grep -qw "$proc_name"; then
+          error "Duplicate process name: $proc_name"
+        fi
+      fi
+
+      seen_names="$seen_names $proc_name"
+      validated_processes="$validated_processes $proc_name:$proc_pid:$proc_port"
+    done
+
+    MONITOR_PROCESSES=$(echo "$validated_processes" | sed 's/^ *//')
   fi
 
   # Auto-generate name if not provided
@@ -327,16 +401,24 @@ main() {
   times_file=$(mktemp)
   exit_codes_file=$(mktemp)
   runs_file=$(mktemp)
-  server_metrics_file=$(mktemp)
 
-  # Capture initial server metrics for leak detection
-  if [ -n "$MONITOR_PID" ]; then
-    initial_stats=$(get_process_stats "$MONITOR_PID")
-    if [ -n "$initial_stats" ]; then
-      initial_mem=$(echo "$initial_stats" | awk '{print $2}')
-    else
-      initial_mem=0
-    fi
+  # Capture initial metrics for all monitored processes (for leak detection)
+  initial_metrics=""
+  if [ -n "$MONITOR_PROCESSES" ]; then
+    for entry in $MONITOR_PROCESSES; do
+      proc_name="${entry%%:*}"
+      rest="${entry#*:}"
+      proc_pid="${rest%%:*}"
+
+      initial_stats=$(get_process_stats "$proc_pid")
+      if [ -n "$initial_stats" ]; then
+        initial_mem=$(echo "$initial_stats" | awk '{print $2}')
+      else
+        initial_mem=0
+      fi
+      initial_metrics="$initial_metrics $proc_name:$initial_mem"
+    done
+    initial_metrics=$(echo "$initial_metrics" | sed 's/^ *//')
   fi
 
   if [ "$QUIET" -eq 0 ]; then
@@ -382,24 +464,41 @@ main() {
     # Combine stdout/stderr into single log for backwards compatibility
     cat "$stdout_file" "$stderr_file" > "$OUTPUT_DIR/runs/${run_num}.log"
 
-    # Capture server metrics if monitoring
-    run_cpu=""
-    run_mem=""
-    if [ -n "$MONITOR_PID" ]; then
-      server_stats=$(get_process_stats "$MONITOR_PID")
-      if [ -n "$server_stats" ]; then
-        run_cpu=$(echo "$server_stats" | awk '{print $1}')
-        run_mem=$(echo "$server_stats" | awk '{print $2}')
-        echo "$run_cpu $run_mem" >> "$server_metrics_file"
-      fi
+    # Capture metrics for all monitored processes
+    processes_json=""
+    if [ -n "$MONITOR_PROCESSES" ]; then
+      timestamp_now=$(get_iso_timestamp)
+      first_proc=1
+      for entry in $MONITOR_PROCESSES; do
+        proc_name="${entry%%:*}"
+        rest="${entry#*:}"
+        proc_pid="${rest%%:*}"
+
+        server_stats=$(get_process_stats "$proc_pid")
+        if [ -n "$server_stats" ]; then
+          run_cpu=$(echo "$server_stats" | awk '{print $1}')
+          run_mem=$(echo "$server_stats" | awk '{print $2}')
+
+          # Write to per-process metrics file
+          echo "$timestamp_now cpu:${run_cpu}% mem:${run_mem}MB" >> "$OUTPUT_DIR/runs/${run_num}.${proc_name}.metrics"
+
+          # Build JSON for this process
+          if [ "$first_proc" -eq 1 ]; then
+            first_proc=0
+          else
+            processes_json="$processes_json,"
+          fi
+          processes_json="$processes_json\"$proc_name\":{\"cpu_percent\":$run_cpu,\"memory_mb\":$run_mem}"
+        fi
+      done
     fi
 
     # Store per-run data as JSON line
-    server_field=""
-    if [ -n "$run_cpu" ] && [ -n "$run_mem" ]; then
-      server_field=",\"server\":{\"cpu_percent\":$run_cpu,\"memory_mb\":$run_mem}"
+    processes_field=""
+    if [ -n "$processes_json" ]; then
+      processes_field=",\"processes\":{$processes_json}"
     fi
-    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$server_field}" >> "$runs_file"
+    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$processes_field}" >> "$runs_file"
 
     # Store results for statistics
     echo "$duration_ms" >> "$times_file"
@@ -487,47 +586,115 @@ main() {
     success_rate=0
   fi
 
-  # Calculate server metrics if monitoring
-  server_json=""
-  if [ -n "$MONITOR_PID" ] && [ -s "$server_metrics_file" ]; then
-    # Get final memory for leak detection
-    final_stats=$(get_process_stats "$MONITOR_PID")
-    if [ -n "$final_stats" ]; then
-      final_mem=$(echo "$final_stats" | awk '{print $2}')
-    else
-      final_mem="$initial_mem"
-    fi
-    mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
+  # Calculate aggregate process metrics if monitoring
+  processes_json=""
+  if [ -n "$MONITOR_PROCESSES" ]; then
+    processes_json=",
+  \"processes\": ["
+    first_proc=1
 
-    # Calculate CPU stats
-    cpu_mean=$(awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}' "$server_metrics_file")
-    cpu_min=$(awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}' "$server_metrics_file")
-    cpu_max=$(awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}' "$server_metrics_file")
+    for entry in $MONITOR_PROCESSES; do
+      proc_name="${entry%%:*}"
+      rest="${entry#*:}"
+      proc_pid="${rest%%:*}"
+      proc_port="${rest#*:}"
 
-    # Calculate memory stats
-    mem_mean=$(awk '{sum+=$2; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}' "$server_metrics_file")
-    mem_min=$(awk 'NR==1{min=$2} {if($2<min)min=$2} END{printf "%.2f", min}' "$server_metrics_file")
-    mem_max=$(awk 'NR==1{max=$2} {if($2>max)max=$2} END{printf "%.2f", max}' "$server_metrics_file")
+      # Get initial memory from saved initial_metrics
+      initial_mem=0
+      for im in $initial_metrics; do
+        im_name="${im%%:*}"
+        im_mem="${im#*:}"
+        if [ "$im_name" = "$proc_name" ]; then
+          initial_mem="$im_mem"
+          break
+        fi
+      done
 
-    server_json=",
-  \"server\": {
-    \"pid\": $MONITOR_PID,
-    \"cpu\": {
-      \"unit\": \"percent\",
-      \"mean\": $cpu_mean,
-      \"min\": $cpu_min,
-      \"max\": $cpu_max
-    },
-    \"memory\": {
-      \"unit\": \"megabytes\",
-      \"mean\": $mem_mean,
-      \"min\": $mem_min,
-      \"max\": $mem_max,
-      \"initial\": $initial_mem,
-      \"final\": $final_mem,
-      \"delta\": $mem_delta
-    }
-  }"
+      # Get final memory for leak detection
+      final_stats=$(get_process_stats "$proc_pid")
+      if [ -n "$final_stats" ]; then
+        final_mem=$(echo "$final_stats" | awk '{print $2}')
+      else
+        final_mem="$initial_mem"
+      fi
+      mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
+
+      # Calculate CPU and memory stats from per-run metrics files
+      metrics_files=$(find "$OUTPUT_DIR/runs" -name "*.${proc_name}.metrics" 2>/dev/null)
+      if [ -n "$metrics_files" ]; then
+        # Extract cpu and mem values from metrics files
+        # Format: "2025-01-30T14:30:52 cpu:15.2% mem:45.0MB"
+        # shellcheck disable=SC2086
+        cpu_values=$(cat $metrics_files 2>/dev/null | sed 's/.*cpu:\([0-9.]*\)%.*/\1/')
+        # shellcheck disable=SC2086
+        mem_values=$(cat $metrics_files 2>/dev/null | sed 's/.*mem:\([0-9.]*\)MB.*/\1/')
+
+        if [ -n "$cpu_values" ]; then
+          cpu_mean=$(echo "$cpu_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+          cpu_min=$(echo "$cpu_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
+          cpu_max=$(echo "$cpu_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
+        else
+          cpu_mean=0
+          cpu_min=0
+          cpu_max=0
+        fi
+
+        if [ -n "$mem_values" ]; then
+          mem_mean=$(echo "$mem_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+          mem_min=$(echo "$mem_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
+          mem_max=$(echo "$mem_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
+        else
+          mem_mean=0
+          mem_min=0
+          mem_max=0
+        fi
+      else
+        cpu_mean=0
+        cpu_min=0
+        cpu_max=0
+        mem_mean=0
+        mem_min=0
+        mem_max=0
+      fi
+
+      # Add comma separator for subsequent entries
+      if [ "$first_proc" -eq 1 ]; then
+        first_proc=0
+      else
+        processes_json="$processes_json,"
+      fi
+
+      # Build port field only if port was specified
+      port_field=""
+      if [ -n "$proc_port" ]; then
+        port_field="
+      \"port\": $proc_port,"
+      fi
+
+      processes_json="$processes_json
+    {
+      \"name\": \"$proc_name\",
+      \"pid\": $proc_pid,$port_field
+      \"cpu\": {
+        \"unit\": \"percent\",
+        \"mean\": $cpu_mean,
+        \"min\": $cpu_min,
+        \"max\": $cpu_max
+      },
+      \"memory\": {
+        \"unit\": \"megabytes\",
+        \"mean\": $mem_mean,
+        \"min\": $mem_min,
+        \"max\": $mem_max,
+        \"initial\": $initial_mem,
+        \"final\": $final_mem,
+        \"delta\": $mem_delta
+      }
+    }"
+    done
+
+    processes_json="$processes_json
+  ]"
   fi
 
   # Build runs array from temp file
@@ -575,12 +742,12 @@ main() {
     "shell": "$SHELL",
     "pwd": "$PWD"
   },
-  "runs": $runs_json$server_json
+  "runs": $runs_json$processes_json
 }
 ENDJSON
 
   # Cleanup temp files
-  rm -f "$times_file" "$exit_codes_file" "$runs_file" "$server_metrics_file"
+  rm -f "$times_file" "$exit_codes_file" "$runs_file"
 
   # Output absolute path
   (cd "$OUTPUT_DIR" && pwd)
