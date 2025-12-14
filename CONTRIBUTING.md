@@ -22,6 +22,9 @@ bats tests/
 # Validate POSIX compliance
 shellcheck -s sh bench
 dash bench --runs 3 "echo test"
+
+# Manual testing
+# See MANUAL-TESTING.md for comprehensive feature verification
 ```
 
 ## Code Style
