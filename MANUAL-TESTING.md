@@ -118,6 +118,26 @@ kill $pid
 2025-12-14T19:28:33 cpu:0.0 mem:2.15    # END (real timestamp)
 ```
 
+**Sampling overhead:**
+
+Each sample requires spawning `ps` and `awk`, which adds ~50-150ms overhead depending on system performance. This means actual intervals will be longer than requested:
+
+```bash
+# Test sampling overhead on your system
+sleep 300 &
+pid=$!
+
+# Request 200ms interval for 2 second command
+# Expected: 2000ms / 200ms = 10 loop samples + 2 (start/end) = 12 total
+bench --runs 1 --metrics-interval 200 --pid "$pid" "sleep 2"
+wc -l bench-results/*/*/runs/*.metrics
+# Actual: 8-10 samples (overhead reduces sample count)
+
+kill $pid
+```
+
+For sub-100ms precision, use specialized tools like `pidstat` or `perf`.
+
 ---
 
 ## 5. Multi-Process Monitoring
