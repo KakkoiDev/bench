@@ -1,6 +1,42 @@
 #!/bin/sh
 # bench - Minimal benchmarking CLI
 # POSIX-compliant shell script (dash-compatible)
+#
+# =============================================================================
+# IMPLEMENTATION NOTES
+# =============================================================================
+#
+# Why POSIX shell?
+#   - Runs on any Unix system without bash dependency
+#   - dash-compatible for faster execution on Debian/Ubuntu
+#   - No bashisms: arrays, [[ ]], etc. avoided intentionally
+#
+# Why Perl for timing?
+#   - POSIX date(1) doesn't support sub-second precision
+#   - Perl's Time::HiRes gives microsecond accuracy (6 decimal places)
+#   - Available on virtually all Unix systems
+#   - Alternatives considered:
+#     * GNU date %N: not portable (BSD/macOS lack it)
+#     * Python: slower startup, heavier dependency
+#     * /proc/uptime: Linux-only
+#
+# Why bc for math?
+#   - POSIX shell has no floating-point arithmetic
+#   - bc is standard on Unix systems (POSIX.1-2001)
+#   - Used for: timing calculations, statistics, memory conversions
+#
+# Why ps for process stats?
+#   - Portable across Unix systems (Linux, macOS, BSD)
+#   - /proc filesystem is Linux-only
+#   - Alternative tools (top, pidstat) have inconsistent interfaces
+#
+# Why this JSON format?
+#   - Self-documenting: units included in each section (e.g., "unit": "milliseconds")
+#   - AI-friendly: structured data for LLM analysis
+#   - jq-friendly: easy querying with standard tools
+#   - Schema versioned: allows tooling to adapt to format changes
+#
+# =============================================================================
 
 set -e
 
@@ -64,12 +100,21 @@ EOF
 }
 
 # Signal handler for SIGINT/SIGTERM (invoked via trap)
+#
+# Why simple flag approach?
+#   - POSIX signal handling is tricky (async-signal-safe functions only)
+#   - Setting a flag is safe; complex logic in handlers is not
+#   - Main loop checks INTERRUPTED flag after each run
+#   - Ensures partial results are saved before exit
+#
 # shellcheck disable=SC2329
 handle_interrupt() {
   INTERRUPTED=1
 }
 
 # Get current time in seconds with microsecond precision
+# Returns: Unix timestamp as float (e.g., "1702567890.123456")
+# Why perl? See IMPLEMENTATION NOTES above. This is the hot path for timing accuracy.
 get_time() {
   perl -MTime::HiRes=time -e 'printf "%.6f\n", time()'
 }
@@ -156,7 +201,14 @@ get_process_name() {
   ps -p "$pid" -o comm= 2>/dev/null | head -1
 }
 
-# Resolve port to PID using lsof (with timeout to prevent hanging)
+# Resolve port to PID using lsof or ss
+#
+# Why lsof first, ss as fallback?
+#   - lsof: widely available, consistent interface across Unix systems
+#   - ss: modern Linux replacement for netstat, faster but Linux-only
+#   - Timeout (3s) prevents hanging on unresponsive systems
+#
+# Returns: PID of process listening on port, or empty string if not found
 resolve_port_to_pid() {
   port="$1"
   # Use timeout if available (3 seconds max)
@@ -177,7 +229,19 @@ resolve_port_to_pid() {
 
 # Sample all monitored processes once (optimized for low overhead)
 # Writes to: $OUTPUT_DIR/runs/${run_num}.${proc_name}.metrics
-# $1 = run number, $2 = timestamp (either ISO format or relative like "+500ms")
+#
+# Args:
+#   $1 = run number
+#   $2 = timestamp (either ISO format or relative like "+500ms")
+#
+# Output format: "timestamp cpu:XX.X mem:XX.XX"
+#   - Labeled values (cpu:, mem:) for human/LLM readability
+#   - Single ps+awk call per process minimizes overhead (~50-150ms total)
+#
+# Overhead considerations:
+#   - Each sample spawns ps(1) and awk(1)
+#   - ~50-150ms overhead per sample depending on system
+#   - For sub-100ms precision, use specialized tools (pidstat, perf)
 sample_processes() {
   run_num="$1"
   timestamp="$2"
@@ -199,6 +263,18 @@ sample_processes() {
 }
 
 # Start background sampler for all monitored processes
+#
+# Timestamp strategy (optimized for reduced overhead):
+#   - START sample: real ISO timestamp via date(1)
+#   - LOOP samples: relative timestamps "+500ms", "+1000ms", etc.
+#   - END sample: real ISO timestamp via date(1)
+#
+# Why relative timestamps in loop?
+#   - Avoids spawning date(1) on every iteration
+#   - Reduces per-sample overhead from ~150ms to ~50ms
+#   - Absolute precision not needed for trend analysis
+#
+# Guaranteed minimum 2 samples per run (START + END) regardless of command duration.
 start_metrics_sampler() {
   run_num="$1"
   interval_sec=$(echo "scale=3; $METRICS_INTERVAL / 1000" | bc)
@@ -460,6 +536,22 @@ main() {
   fi
 
   # Create output directory: ./bench-results/<name>/YYYYMMDD-HHMMSS-PID/
+  #
+  # Directory structure:
+  #   bench-results/
+  #     <name>/                    # Groups related benchmarks (e.g., "api", "login")
+  #       YYYYMMDD-HHMMSS-PID/     # Unique per run (timestamp + PID prevents collisions)
+  #         benchmark.json         # Aggregate results and per-run data
+  #         runs/
+  #           1.log                # Combined stdout+stderr for run 1
+  #           1.stdout             # Raw stdout
+  #           1.stderr             # Raw stderr
+  #           1.app.metrics        # Process metrics samples (if --pid/--port used)
+  #
+  # Why timestamp-PID suffix?
+  #   - Allows concurrent benchmarks with same --name without collision
+  #   - PID ensures uniqueness even if started in same second
+  #   - Chronological sorting by directory name
   timestamp=$(date '+%Y%m%d-%H%M%S')
   OUTPUT_DIR="./bench-results/${NAME}/${timestamp}-$$"
   mkdir -p "$OUTPUT_DIR/runs"
