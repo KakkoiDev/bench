@@ -16,7 +16,7 @@ load helpers
   [ -f "$json_file" ]
 
   # Verify all required fields present
-  grep -q '"schema_version": "1.0"' "$json_file"
+  grep -q '"schema_version": "2.0"' "$json_file"
   grep -q '"name": "integration-test"' "$json_file"
   grep -q '"message": "full workflow"' "$json_file"
   grep -q '"runs_requested": 10' "$json_file"
@@ -49,8 +49,8 @@ load helpers
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
 
-  # Verify server metrics present
-  grep -q '"server":' "$json_file"
+  # Verify process metrics present (schema 2.0 uses "processes" array)
+  grep -q '"processes":' "$json_file"
   grep -q '"cpu":' "$json_file"
   grep -q '"memory":' "$json_file"
   grep -q '"initial":' "$json_file"
@@ -204,7 +204,7 @@ load helpers
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
 
   grep -q '"tool": "bench"' "$json_file"
-  grep -q '"tool_version": "1.0.0"' "$json_file"
+  grep -q '"tool_version": "2.0.0"' "$json_file"
 }
 
 @test "quiet mode suppresses progress output" {

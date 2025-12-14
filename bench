@@ -39,6 +39,7 @@ Options:
 
   --pid [NAME:]PID    Monitor process CPU/memory by PID (repeatable)
   --port [NAME:]PORT  Monitor process by port (repeatable)
+  --metrics-interval MS  Metrics sampling interval (default: 500, min: 100)
 
   --help              Show help
   --version           Show version
@@ -174,6 +175,61 @@ resolve_port_to_pid() {
   fi
 }
 
+# Sample all monitored processes once (optimized for low overhead)
+# Writes to: $OUTPUT_DIR/runs/${run_num}.${proc_name}.metrics
+# $1 = run number, $2 = timestamp (either ISO format or relative like "+500ms")
+sample_processes() {
+  run_num="$1"
+  timestamp="$2"
+  for entry in $MONITOR_PROCESSES; do
+    proc_name="${entry%%:*}"
+    rest="${entry#*:}"
+    proc_pid="${rest%%:*}"
+
+    if kill -0 "$proc_pid" 2>/dev/null; then
+      # Single ps+awk call: get cpu% and convert rss KB to MB in one step
+      stats=$(ps -p "$proc_pid" -o %cpu=,rss= 2>/dev/null | awk 'NR==1 {printf "%.1f %.2f", $1, $2/1024}')
+      if [ -n "$stats" ]; then
+        cpu="${stats%% *}"
+        mem="${stats#* }"
+        echo "$timestamp cpu:$cpu mem:$mem" >> "$OUTPUT_DIR/runs/${run_num}.${proc_name}.metrics"
+      fi
+    fi
+  done
+}
+
+# Start background sampler for all monitored processes
+start_metrics_sampler() {
+  run_num="$1"
+  interval_sec=$(echo "scale=3; $METRICS_INTERVAL / 1000" | bc)
+
+  # Take immediate sample at START with real timestamp
+  sample_processes "$run_num" "$(date +%Y-%m-%dT%H:%M:%S)"
+
+  # Start background loop with relative timestamps (no date calls = fast)
+  (
+    elapsed_ms=0
+    while true; do
+      sleep "$interval_sec"
+      elapsed_ms=$((elapsed_ms + METRICS_INTERVAL))
+      sample_processes "$run_num" "+${elapsed_ms}ms"
+    done
+  ) &
+  SAMPLER_PID=$!
+}
+
+# Stop background sampler and take final sample
+stop_metrics_sampler() {
+  run_num="$1"
+  if [ -n "$SAMPLER_PID" ]; then
+    kill "$SAMPLER_PID" 2>/dev/null
+    wait "$SAMPLER_PID" 2>/dev/null
+    SAMPLER_PID=""
+  fi
+  # Take final sample at END with real timestamp
+  sample_processes "$run_num" "$(date +%Y-%m-%dT%H:%M:%S)"
+}
+
 # Main entry point
 main() {
   # Default values
@@ -182,6 +238,7 @@ main() {
   MESSAGE=""
   QUIET=0
   MONITOR_PROCESSES=""  # Space-separated list of "name:pid:port" entries
+  METRICS_INTERVAL=500  # Sampling interval in milliseconds
   COMMAND=""
 
   # Parse arguments
@@ -312,6 +369,22 @@ main() {
         MONITOR_PROCESSES="$MONITOR_PROCESSES $proc_name:$resolved_pid:$proc_port"
         shift
         ;;
+      --metrics-interval)
+        shift
+        if [ -z "$1" ]; then
+          error "--metrics-interval requires an argument"
+        fi
+        case "$1" in
+          ''|*[!0-9]*)
+            error "--metrics-interval requires a numeric argument"
+            ;;
+        esac
+        if [ "$1" -lt 100 ]; then
+          error "--metrics-interval minimum is 100ms"
+        fi
+        METRICS_INTERVAL="$1"
+        shift
+        ;;
       --)
         shift
         COMMAND="$*"
@@ -435,6 +508,11 @@ main() {
     start_iso=$(get_iso_timestamp)
     start_time=$(get_time)
 
+    # Start metrics sampler before command
+    if [ -n "$MONITOR_PROCESSES" ]; then
+      start_metrics_sampler "$run_num"
+    fi
+
     # Run command in background to allow signal handling
     # Capture stdout and stderr separately
     stdout_file="$OUTPUT_DIR/runs/${run_num}.stdout"
@@ -443,6 +521,11 @@ main() {
     cmd_pid=$!
     wait $cmd_pid 2>/dev/null
     cmd_exit=$?
+
+    # Stop metrics sampler after command
+    if [ -n "$MONITOR_PROCESSES" ]; then
+      stop_metrics_sampler "$run_num"
+    fi
 
     end_time=$(get_time)
     end_iso=$(get_iso_timestamp)
@@ -465,20 +548,19 @@ main() {
     # Combine stdout/stderr into single log for backwards compatibility
     cat "$stdout_file" "$stderr_file" > "$OUTPUT_DIR/runs/${run_num}.log"
 
-    # Capture metrics for all monitored processes
+    # Calculate per-run metrics from .metrics files
     processes_json=""
     if [ -n "$MONITOR_PROCESSES" ]; then
-      timestamp_now=$(get_iso_timestamp)
       first_proc=1
       for entry in $MONITOR_PROCESSES; do
         proc_name="${entry%%:*}"
-        rest="${entry#*:}"
-        proc_pid="${rest%%:*}"
+        metrics_file="$OUTPUT_DIR/runs/${run_num}.${proc_name}.metrics"
 
-        server_stats=$(get_process_stats "$proc_pid")
-        if [ -n "$server_stats" ]; then
-          run_cpu=$(echo "$server_stats" | awk '{print $1}')
-          run_mem=$(echo "$server_stats" | awk '{print $2}')
+        if [ -f "$metrics_file" ]; then
+          # Calculate mean CPU and memory from all samples in .metrics file
+          # File format: timestamp cpu:value mem:value
+          run_cpu=$(sed 's/.*cpu:\([0-9.]*\).*/\1/' "$metrics_file" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+          run_mem=$(sed 's/.*mem:\([0-9.]*\).*/\1/' "$metrics_file" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
 
           # Build JSON for this process
           if [ "$first_proc" -eq 1 ]; then
@@ -617,30 +699,37 @@ main() {
       fi
       mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
 
-      # Calculate CPU and memory stats from per-run JSON data
-      # Extract values from runs file: {"processes":{"app":{"cpu_percent":15.2,"memory_mb":45.0}}}
-      cpu_values=$(grep -o "\"$proc_name\":{[^}]*}" "$runs_file" 2>/dev/null | sed 's/.*"cpu_percent":\([0-9.]*\).*/\1/')
-      mem_values=$(grep -o "\"$proc_name\":{[^}]*}" "$runs_file" 2>/dev/null | sed 's/.*"memory_mb":\([0-9.]*\).*/\1/')
+      # Calculate CPU and memory stats from all .metrics files for this process
+      # Concatenate all metrics files for this process across all runs
+      all_metrics_file=$(mktemp)
+      for metrics_file in "$OUTPUT_DIR/runs/"*."${proc_name}".metrics; do
+        if [ -f "$metrics_file" ]; then
+          cat "$metrics_file" >> "$all_metrics_file"
+        fi
+      done
 
-      if [ -n "$cpu_values" ]; then
+      if [ -s "$all_metrics_file" ]; then
+        # File format: timestamp cpu:value mem:value
+        # Extract values using sed, then calculate stats
+        cpu_values=$(sed 's/.*cpu:\([0-9.]*\).*/\1/' "$all_metrics_file")
+        mem_values=$(sed 's/.*mem:\([0-9.]*\).*/\1/' "$all_metrics_file")
+
         cpu_mean=$(echo "$cpu_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
         cpu_min=$(echo "$cpu_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
         cpu_max=$(echo "$cpu_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
-      else
-        cpu_mean=0
-        cpu_min=0
-        cpu_max=0
-      fi
 
-      if [ -n "$mem_values" ]; then
         mem_mean=$(echo "$mem_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
         mem_min=$(echo "$mem_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
         mem_max=$(echo "$mem_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
       else
+        cpu_mean=0
+        cpu_min=0
+        cpu_max=0
         mem_mean=0
         mem_min=0
         mem_max=0
       fi
+      rm -f "$all_metrics_file"
 
       # Add comma separator for subsequent entries
       if [ "$first_proc" -eq 1 ]; then

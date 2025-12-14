@@ -341,3 +341,103 @@ load helpers
 
   kill_mock_process "$MOCK_PID"
 }
+
+# =============================================================================
+# Continuous Metrics Sampling Tests
+# =============================================================================
+
+@test "metrics files created for each process" {
+  cd "$TEST_TEMP_DIR"
+
+  create_mock_process 60 pid
+
+  run_bench --runs 1 --quiet --pid "app:$pid" "sleep 0.1"
+  [ "$status" -eq 0 ]
+
+  metrics_file=$(find "$TEST_TEMP_DIR/bench-results" -name "*.app.metrics" | head -1)
+  [ -f "$metrics_file" ]
+
+  # Should have at least 2 samples (start + end, guaranteed)
+  line_count=$(wc -l < "$metrics_file")
+  [ "$line_count" -ge 2 ]
+
+  kill_mock_process "$pid"
+}
+
+@test "continuous sampling captures multiple readings" {
+  cd "$TEST_TEMP_DIR"
+
+  create_mock_process 60 pid
+
+  # Run a command that takes ~1.5 seconds with 500ms interval
+  run_bench --runs 1 --quiet --pid "app:$pid" "sleep 1.5"
+  [ "$status" -eq 0 ]
+
+  metrics_file=$(find "$TEST_TEMP_DIR/bench-results" -name "*.app.metrics" | head -1)
+  [ -f "$metrics_file" ]
+
+  # Should have multiple samples: start + ~2-3 from loop + end
+  line_count=$(wc -l < "$metrics_file")
+  [ "$line_count" -ge 4 ]
+
+  kill_mock_process "$pid"
+}
+
+@test "--metrics-interval accepts valid value" {
+  cd "$TEST_TEMP_DIR"
+
+  create_mock_process 60 pid
+
+  # Use longer command and longer interval to reduce overhead impact
+  run_bench --runs 1 --quiet --metrics-interval 200 --pid "$pid" "sleep 1.5"
+  [ "$status" -eq 0 ]
+
+  metrics_file=$(find "$TEST_TEMP_DIR/bench-results" -name "*.metrics" | head -1)
+  [ -f "$metrics_file" ]
+
+  # At 200ms interval for 1.5s command: start + ~5-7 from loop + end
+  # Account for sampling overhead - expect at least 4 samples
+  line_count=$(wc -l < "$metrics_file")
+  [ "$line_count" -ge 4 ]
+
+  kill_mock_process "$pid"
+}
+
+@test "--metrics-interval rejects value below 100" {
+  run_bench --metrics-interval 50 "echo test"
+  [ "$status" -eq 1 ]
+  [[ "$output" =~ "minimum is 100ms" ]]
+}
+
+@test "CPU-intensive process shows non-zero CPU in JSON" {
+  cd "$TEST_TEMP_DIR"
+
+  # Start a CPU-intensive process (yes writing to /dev/null)
+  yes > /dev/null &
+  cpu_pid=$!
+
+  # Ensure cleanup on exit
+  trap "kill $cpu_pid 2>/dev/null" EXIT
+
+  sleep 0.2  # Let it spin up
+
+  "$BENCH_SCRIPT" --runs 1 --quiet --pid "cpu:$cpu_pid" "sleep 0.5"
+
+  # Verify metrics file exists and has high CPU values
+  metrics_file=$(find "$TEST_TEMP_DIR/bench-results" -name "*.cpu.metrics" | head -1)
+  [ -f "$metrics_file" ]
+
+  # Check that metrics file has non-zero CPU (format: cpu:XX.X)
+  grep -qE 'cpu:[1-9]' "$metrics_file"
+
+  # Verify JSON aggregates show non-zero CPU mean
+  json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
+  cpu_mean=$(jq '.processes[0].cpu.mean' "$json_file")
+
+  # CPU mean should be > 10 (sanity check that parsing works)
+  result=$(echo "$cpu_mean > 10" | bc)
+  [ "$result" -eq 1 ]
+
+  kill $cpu_pid 2>/dev/null || true
+  trap - EXIT
+}

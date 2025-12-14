@@ -83,6 +83,7 @@ Options:
   --quiet             Suppress progress output, only print results path
   --pid [NAME:]PID    Monitor process CPU/memory by PID (repeatable)
   --port [NAME:]PORT  Monitor process by port (repeatable)
+  --metrics-interval MS  Metrics sampling interval (default: 500, min: 100)
   --help              Show help
   --version           Show version
 ```
@@ -97,6 +98,7 @@ Results saved to `./bench-results/<name>/<timestamp>/`:
 benchmark.json        # all metrics
 runs/
   1.log               # stdout/stderr per run
+  1.app.metrics       # CPU/memory samples (format: "timestamp cpu:% mem:MB")
 ```
 
 **benchmark.json:**
