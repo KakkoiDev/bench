@@ -36,6 +36,9 @@
 #   - jq-friendly: easy querying with standard tools
 #   - Schema versioned: allows tooling to adapt to format changes
 #
+# For function-level implementation details, see comments throughout the code.
+# For manual testing procedures, see MANUAL-TESTING.md
+#
 # =============================================================================
 
 set -e
