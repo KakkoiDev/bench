@@ -39,11 +39,15 @@ cd bench
 
 Installs a [Claude Code](https://github.com/anthropics/claude-code) skill and agent for running benchmarks and analyzing results.
 
-```bash
-# Remote
-curl -fsSL https://raw.githubusercontent.com/KakkoiDev/bench/main/install.sh | sh -s -- --with-claude
+Remote:
 
-# Local
+```bash
+curl -fsSL https://raw.githubusercontent.com/KakkoiDev/bench/main/install.sh | sh -s -- --with-claude
+```
+
+Local:
+
+```bash
 ./install.sh --with-claude
 ```
 
