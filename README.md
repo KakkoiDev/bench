@@ -34,7 +34,10 @@ cd bench
 ./install.sh
 ```
 
-To also install the [Claude Code](https://github.com/anthropics/claude-code) skill and agent:
+<details>
+<summary>With Claude Code integration</summary>
+
+Installs a [Claude Code](https://github.com/anthropics/claude-code) skill and agent for running benchmarks and analyzing results.
 
 ```bash
 # Remote
@@ -43,6 +46,8 @@ curl -fsSL https://raw.githubusercontent.com/KakkoiDev/bench/main/install.sh | s
 # Local
 ./install.sh --with-claude
 ```
+
+</details>
 
 <details>
 <summary>Manual installation</summary>
