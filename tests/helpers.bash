@@ -120,7 +120,7 @@ get_server_port() {
   # Extract port from lsof output: *:8000 -> 8000
   local port
   port=$(lsof -Pan -p "$pid" -i TCP -sTCP:LISTEN 2>/dev/null | \
-    awk 'NR>1 {split($9,a,":"); print a[2]; exit}')
+    awk -v pid="$pid" 'NR>1 && $2==pid {split($9,a,":"); print a[2]; exit}')
 
   # Validate port is numeric (1-65535)
   case "$port" in

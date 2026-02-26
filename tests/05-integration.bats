@@ -157,8 +157,9 @@ load helpers
 @test "output bytes tracked correctly" {
   cd "$TEST_TEMP_DIR"
 
-  # Command that produces known output sizes (7 chars)
-  run_bench --runs 3 --quiet "echo -n 'seven77'"
+  # Command that produces known output sizes (7 chars, no trailing newline)
+  # Use printf instead of echo -n (echo -n is not POSIX)
+  run_bench --runs 3 --quiet "printf 'seven77'"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
@@ -171,7 +172,8 @@ load helpers
 @test "stderr bytes tracked correctly" {
   cd "$TEST_TEMP_DIR"
 
-  run_bench --runs 3 --quiet "echo -n 'error' >&2"
+  # Use printf instead of echo -n (echo -n is not POSIX)
+  run_bench --runs 3 --quiet "printf 'error' >&2"
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
