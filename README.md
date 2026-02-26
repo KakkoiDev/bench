@@ -23,6 +23,12 @@ bench --port 8080 "k6 run load-test.js"
 ## Installation
 
 ```bash
+curl -fsSL https://raw.githubusercontent.com/KakkoiDev/bench/main/install.sh | sh
+```
+
+Or clone and run locally:
+
+```bash
 git clone https://github.com/KakkoiDev/bench.git
 cd bench
 ./install.sh

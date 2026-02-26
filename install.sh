@@ -4,8 +4,17 @@
 set -e
 
 VERSION="2.1.0"
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-BENCH_SOURCE="$SCRIPT_DIR/bench"
+REPO_URL="https://raw.githubusercontent.com/KakkoiDev/bench/main"
+
+# Detect local vs remote (curl | sh) mode
+SCRIPT_DIR="$(cd "$(dirname "$0")" 2>/dev/null && pwd)" || SCRIPT_DIR=""
+if [ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/bench" ]; then
+  LOCAL_MODE=1
+  BENCH_SOURCE="$SCRIPT_DIR/bench"
+else
+  LOCAL_MODE=0
+  BENCH_SOURCE=""
+fi
 
 # Defaults
 INSTALL_DIR=""
@@ -18,10 +27,9 @@ if [ -t 1 ]; then
   GREEN='\033[0;32m'
   RED='\033[0;31m'
   YELLOW='\033[0;33m'
-  BOLD='\033[1m'
   RESET='\033[0m'
 else
-  GREEN="" RED="" YELLOW="" BOLD="" RESET=""
+  GREEN="" RED="" YELLOW="" RESET=""
 fi
 
 info()  { printf "${GREEN}[+]${RESET} %s\n" "$1"; }
@@ -116,15 +124,31 @@ check_deps() {
   fi
 }
 
+# --- Download helper (remote mode) ---
+
+download() {
+  _dl_url="$1" _dl_dest="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$_dl_url" -o "$_dl_dest"
+  elif command -v wget >/dev/null 2>&1; then
+    wget -qO "$_dl_dest" "$_dl_url"
+  else
+    die "curl or wget required for remote install"
+  fi
+}
+
 # --- Install bench ---
 
 install_bench() {
-  if [ ! -f "$BENCH_SOURCE" ]; then
-    die "bench script not found at $BENCH_SOURCE"
+  mkdir -p "$INSTALL_DIR"
+
+  if [ "$LOCAL_MODE" = 1 ]; then
+    cp "$BENCH_SOURCE" "$INSTALL_DIR/bench"
+  else
+    info "Downloading bench from GitHub..."
+    download "$REPO_URL/bench" "$INSTALL_DIR/bench"
   fi
 
-  mkdir -p "$INSTALL_DIR"
-  cp "$BENCH_SOURCE" "$INSTALL_DIR/bench"
   chmod +x "$INSTALL_DIR/bench"
   info "Installed bench to $INSTALL_DIR/bench"
 
@@ -151,17 +175,25 @@ install_claude() {
   fi
 
   if [ ! -d "$CLAUDE_DIR" ]; then
-    die "~/.claude directory not found. Is Claude Code installed?"
+    die "$HOME/.claude directory not found. Is Claude Code installed?"
   fi
 
   # Install agent
   mkdir -p "$CLAUDE_DIR/agents"
-  cp "$SCRIPT_DIR/.claude/agents/bench.md" "$AGENT_FILE"
+  if [ "$LOCAL_MODE" = 1 ]; then
+    cp "$SCRIPT_DIR/.claude/agents/bench.md" "$AGENT_FILE"
+  else
+    download "$REPO_URL/.claude/agents/bench.md" "$AGENT_FILE"
+  fi
   info "Installed agent to $AGENT_FILE"
 
   # Install skill
   mkdir -p "$SKILL_DIR"
-  cp "$SCRIPT_DIR/.claude/skills/bench/SKILL.md" "$SKILL_FILE"
+  if [ "$LOCAL_MODE" = 1 ]; then
+    cp "$SCRIPT_DIR/.claude/skills/bench/SKILL.md" "$SKILL_FILE"
+  else
+    download "$REPO_URL/.claude/skills/bench/SKILL.md" "$SKILL_FILE"
+  fi
   info "Installed skill to $SKILL_FILE"
 }
 
