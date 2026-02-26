@@ -7,6 +7,8 @@
 !DEVELOPMENT.md
 !PHILOSOPHY.md
 !MANUAL-TESTING.md
+!.claude/agents/*.md
+!.claude/skills/**/*.md
 
 # Test results and benchmarks
 bench-results/

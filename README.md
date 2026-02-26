@@ -25,9 +25,40 @@ bench --port 8080 "k6 run load-test.js"
 ```bash
 git clone https://github.com/KakkoiDev/bench.git
 cd bench
+./install.sh
+```
+
+To also install the [Claude Code](https://github.com/anthropics/claude-code) skill and agent:
+
+```bash
+./install.sh --with-claude
+```
+
+<details>
+<summary>Manual installation</summary>
+
+```bash
 chmod +x bench
 sudo ln -s "$(pwd)/bench" /usr/local/bin/bench
 ```
+
+</details>
+
+<details>
+<summary>Install options</summary>
+
+```
+./install.sh [OPTIONS]
+
+Options:
+  --dir PATH        Install directory (default: ~/.local/bin or /usr/local/bin)
+  --with-claude     Also install Claude Code skill and agent
+  --skip-deps       Skip dependency checks
+  --uninstall       Remove bench and optional Claude Code files
+  --help            Show this help
+```
+
+</details>
 
 ## Usage
 
