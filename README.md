@@ -203,6 +203,10 @@ bench --runs 20 \
   "curl -s localhost:5000/api/data"
 ```
 
+## Future direction
+
+See [GENERAL-BENCHMARK-DESIGN.md](GENERAL-BENCHMARK-DESIGN.md) for the implementation proposal to extend Bench into a domain-agnostic, evidence-producing experiment runner while preserving the current simple CLI.
+
 ## Contributing
 
 ```bash
