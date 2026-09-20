@@ -138,7 +138,12 @@ Options:
   --version           Show version
 ```
 
-Note: Process names cannot contain colons (`:` is the delimiter).
+Naming rules:
+
+- Process names may contain letters, digits, `.`, `_` and `-` (`:` is the
+  `NAME:PID` delimiter). Auto-detected names are sanitized to this set.
+- `--name` must be a single directory name: no `/`, `.` or `..`, so results
+  always stay inside `bench-results/`.
 
 ### Output
 
@@ -147,8 +152,18 @@ Results saved to `./bench-results/<name>/<timestamp>/`:
 ```
 benchmark.json        # all metrics
 runs/
-  1.log               # stdout/stderr per run
+  1.log               # stdout + stderr combined, per run
+  1.stdout            # raw stdout
+  1.stderr            # raw stderr
   1.app.metrics       # CPU/memory samples (format: "timestamp cpu:% mem:MB")
+```
+
+All string fields in `benchmark.json` are JSON-escaped, so commands
+containing quotes or backslashes still produce parseable output:
+
+```bash
+jq -r .command "$(bench --quiet 'echo "hello"')/benchmark.json"
+# echo "hello"
 ```
 
 **benchmark.json:**
