@@ -26,6 +26,23 @@ Output location: `./bench-results/<name>/<timestamp>/benchmark.json`
 | `processes[].cpu.mean` | Average CPU usage during benchmark |
 | `processes[].memory.delta` | Memory change from start to end |
 | `runs[].duration_ms` | Per-run timing for outlier detection |
+| `metrics.<name>.mean` | Custom metric the command reported |
+| `metrics.<name>.values` | Every raw observation, in run order |
+| `runs_valid` / `valid_rate` | Runs that passed independent validation |
+| `validity.*` | Why runs failed, by class |
+| `runs[].status` | Per-run outcome (see below) |
+
+### Validity vs success
+
+`runs_successful` counts exit code 0. `runs_valid` counts runs that were
+actually validated. When `--evaluate` or `--require` is used these differ, and
+`runs_valid` is the one that matters — report it.
+
+`runs[].status` is one of `ok`, `command_failed`, `invalid_result`,
+`declared_invalid`, `evaluator_failed`, `constraint_failed`,
+`infrastructure_failed`. `runs[].error` explains the failure. Never treat a
+run as good because the command reported `"valid": true` — bench deliberately
+ignores that claim.
 
 ### CLI Reference
 
@@ -39,6 +56,10 @@ bench [OPTIONS] COMMAND
 --pid [NAME:]PID    Monitor process by PID (repeatable)
 --port [NAME:]PORT  Monitor process by port (repeatable)
 --metrics-interval MS  Sampling interval (default: 500, min: 100)
+--evaluate CMD      Independently validate each run (gets the run dir)
+--expect-exit CODE  Required exit code, or "any" (default: 0)
+--require EXPR      Constraint on a metric, e.g. "errors == 0"
+--require-artifact PATH   Artifact that must exist after the run
 ```
 
 ## Analysis Workflow

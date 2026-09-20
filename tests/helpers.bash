@@ -159,3 +159,61 @@ kill_mock_process() {
     wait "$pid" 2>/dev/null || true
   fi
 }
+
+# -----------------------------------------------------------------------------
+# Evidence-protocol helpers (schema 2.1)
+# -----------------------------------------------------------------------------
+
+# Helper: Write an executable script into the test temp dir
+# Usage: make_script emit.sh '#!/bin/sh
+# echo hi'
+# Returns: nothing; the script is at $TEST_TEMP_DIR/<name>
+make_script() {
+  local name="$1"
+  local body="$2"
+  printf '%s\n' "$body" > "$TEST_TEMP_DIR/$name"
+  chmod +x "$TEST_TEMP_DIR/$name"
+}
+
+# Helper: Write a subject that emits the given result.json body verbatim
+# Usage: make_emitter emit.sh '{"metrics":{"a":1}}'
+make_emitter() {
+  local name="$1"
+  local json="$2"
+  make_script "$name" "#!/bin/sh
+cat > \"\$BENCH_RESULT_JSON\" <<'RESULT_EOF'
+$json
+RESULT_EOF"
+}
+
+# Helper: Write a subject that emits the given metrics.jsonl body verbatim
+# Usage: make_streamer emit.sh '{"type":"metric","name":"a","value":1}'
+make_streamer() {
+  local name="$1"
+  local jsonl="$2"
+  make_script "$name" "#!/bin/sh
+cat > \"\$BENCH_METRICS\" <<'STREAM_EOF'
+$jsonl
+STREAM_EOF"
+}
+
+# Helper: Path to the benchmark.json produced by the last run
+bench_json() {
+  find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1
+}
+
+# Helper: Status of a run, 1-indexed
+# Usage: run_status 1
+run_status() {
+  jq -r ".runs[$(( $1 - 1 ))].status" "$(bench_json)"
+}
+
+# Helper: Error text of a run, 1-indexed
+run_error() {
+  jq -r ".runs[$(( $1 - 1 ))].error" "$(bench_json)"
+}
+
+# Helper: Directory holding a run's evidence, 1-indexed
+run_dir() {
+  dirname "$(bench_json)"
+}

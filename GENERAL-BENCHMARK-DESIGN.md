@@ -1,6 +1,6 @@
 # General Benchmark Design
 
-Status: implementation proposal
+Status: phases 1 and 2 implemented (schema 2.1); phases 3-6 proposed
 
 ## Objective
 
@@ -305,26 +305,48 @@ If a rewrite becomes necessary, preserve the CLI, result schema, and command-bas
 
 ## Implementation phases
 
-### Phase 1 — Stable evidence format
+### Phase 1 — Stable evidence format — implemented
 
-- [ ] Specify and version experiment, run, metric, environment, and artifact JSON.
-- [ ] Preserve raw per-run metrics.
-- [ ] Add custom numeric metric ingestion.
-- [ ] Register artifacts and evidence.
-- [ ] Validate emitted data with useful errors.
-- [ ] Test backward compatibility with current schema 2.0 results.
+- [x] Specify and version experiment, run, metric, environment, and artifact JSON.
+- [x] Preserve raw per-run metrics.
+- [x] Add custom numeric metric ingestion.
+- [x] Register artifacts and evidence.
+- [x] Validate emitted data with useful errors.
+- [x] Test backward compatibility with current schema 2.0 results.
 
 Acceptance: a command can emit domain metrics and artifacts, and the saved result is understandable without Bench.
 
-### Phase 2 — Evaluators and validity
+Delivered as schema 2.1. A command writes `result.json` and/or `metrics.jsonl`
+into `$BENCH_RUN_DIR`; both are parsed with JSON::PP, not text tools. Metric
+names must be stable identifiers and values finite numbers, so NaN, Infinity,
+booleans and non-numeric strings are rejected with an error naming the metric
+and, for streamed events, the line. Every observation is retained under
+`metrics.<name>.values` with the run it came from; outliers are never trimmed.
+Unknown fields survive under `metrics.json`'s `source`. Registered paths must
+be relative and inside the run directory. In-flight runs carry an `INCOMPLETE`
+marker so an interrupted run cannot be mistaken for a finished one.
 
-- [ ] Add an independent evaluator command.
-- [ ] Pass the run directory using a documented interface.
-- [ ] Record evaluator stdout, stderr, exit status, and result.
-- [ ] Add hard constraints and required artifacts.
-- [ ] Distinguish command failure, evaluator failure, constraint failure, and infrastructure failure.
+### Phase 2 — Evaluators and validity — implemented
+
+- [x] Add an independent evaluator command.
+- [x] Pass the run directory using a documented interface.
+- [x] Record evaluator stdout, stderr, exit status, and result.
+- [x] Add hard constraints and required artifacts.
+- [x] Distinguish command failure, evaluator failure, constraint failure, and infrastructure failure.
 
 Acceptance: a benchmark subject cannot mark itself successful without independent validation.
+
+`--evaluate CMD` runs after the timing clock has stopped, so evaluation never
+inflates the measurement. The evaluator receives the run directory as `$1` and
+in `$BENCH_RUN_DIR`, plus `$BENCH_EXIT_CODE`, `$BENCH_STDOUT` and
+`$BENCH_STDERR`; its stdout, stderr, exit status and emitted result are all
+recorded. `--require "<metric> <op> <number>"` uses a fixed three-term grammar
+that is parsed, never evaluated, so nothing from a result file reaches a shell.
+Per-run status is one of `ok`, `command_failed`, `invalid_result`,
+`declared_invalid`, `evaluator_failed`, `constraint_failed` or
+`infrastructure_failed`, and `runs_valid` is reported separately from
+`runs_successful`. A subject's own `"valid": true` is recorded and ignored; its
+`"valid": false` is honoured.
 
 ### Phase 3 — Manifests and variants
 
