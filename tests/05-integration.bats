@@ -206,7 +206,11 @@ load helpers
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
 
   grep -q '"tool": "bench"' "$json_file"
-  grep -q '"tool_version": "2.1.0"' "$json_file"
+
+  # Derived from the script rather than hardcoded, so bumping the version
+  # does not require editing this test
+  expected_version=$("$BENCH_SCRIPT" --version | sed 's/^bench v//')
+  grep -q "\"tool_version\": \"$expected_version\"" "$json_file"
 }
 
 @test "quiet mode suppresses progress output" {

@@ -43,13 +43,38 @@
 
 set -e
 
-VERSION="2.1.0"
+VERSION="2.2.0"
 SCHEMA_VERSION="2.0"
 
 # Global state for signal handling
 INTERRUPTED=0
 RUNS_COMPLETED=0
 OUTPUT_DIR=""
+
+# Resources released by cleanup() on exit (see trap below)
+SAMPLER_PID=""
+TIMES_FILE=""
+EXIT_CODES_FILE=""
+RUNS_FILE=""
+
+# Release resources that would otherwise outlive the script.
+#
+# Registered on EXIT so that an error, a signal, or a normal exit all reclaim
+# the same things: the background metrics sampler (which loops forever and
+# would be orphaned) and the mktemp scratch files.
+#
+# shellcheck disable=SC2317,SC2329
+cleanup() {
+  if [ -n "$SAMPLER_PID" ]; then
+    kill "$SAMPLER_PID" 2>/dev/null || true
+    SAMPLER_PID=""
+  fi
+  [ -n "$TIMES_FILE" ] && rm -f "$TIMES_FILE"
+  [ -n "$EXIT_CODES_FILE" ] && rm -f "$EXIT_CODES_FILE"
+  [ -n "$RUNS_FILE" ] && rm -f "$RUNS_FILE"
+  return 0
+}
+trap 'cleanup' EXIT
 
 # Error handling
 error() {
@@ -89,6 +114,11 @@ Examples:
   bench --pid 12345 --pid 67890 "curl localhost:8080"
   bench --pid app:12345 --port redis:6379 "curl localhost:8080"
 
+Naming:
+  Process names may contain letters, digits, '.', '_' and '-'
+  (':' is the NAME:PID delimiter). --name must be a single directory
+  name: no '/', '.' or '..'.
+
 Output:
   Results saved to: ./bench-results/<name>/<timestamp-pid>/
     - benchmark.json (all metrics)
@@ -110,7 +140,7 @@ EOF
 #   - Main loop checks INTERRUPTED flag after each run
 #   - Ensures partial results are saved before exit
 #
-# shellcheck disable=SC2329
+# shellcheck disable=SC2317,SC2329
 handle_interrupt() {
   INTERRUPTED=1
 }
@@ -134,6 +164,75 @@ get_iso_timestamp() {
 # Normalize bc output to always have leading zero
 bc_normalize() {
   echo "$1" | bc | sed 's/^\./0./; s/^-\./-0./'
+}
+
+# Escape a string for embedding inside a JSON string literal
+#
+# Why this matters: every string field in benchmark.json is user-controlled
+# (command, message, name, cwd). Without escaping, a command as ordinary as
+#   bench 'echo "hello"'
+# emits `"command": "echo "hello""` and the whole file fails to parse, which
+# defeats the point of a tool whose output is meant to be machine-read.
+#
+# Why perl? It is already a hard dependency (see check_dependencies), and it
+# handles the full escape set - backslash, quote, and the C0 control
+# characters that JSON requires as \uXXXX - in a single pass.
+#
+# Args: $1 = raw string
+# Returns: escaped string, safe to place between double quotes
+json_escape() {
+  printf '%s' "$1" | perl -0777 -pe '
+    s/\\/\\\\/g;
+    s/"/\\"/g;
+    s/\n/\\n/g;
+    s/\r/\\r/g;
+    s/\t/\\t/g;
+    s/([\x00-\x1f])/sprintf("\\u%04x", ord($1))/ge;
+  '
+}
+
+# Reduce a string to a token safe for use as a filename component,
+# a whitespace-delimited list entry, and a JSON object key.
+#
+# Process names are used in all three roles: they become
+# runs/<n>.<name>.metrics, they are stored space-separated in
+# MONITOR_PROCESSES, and they key the per-run "processes" object. Anything
+# outside [A-Za-z0-9._-] breaks at least one of those, so it is folded to "-".
+#
+# A leading path is stripped first: macOS `ps -o comm=` reports the full
+# executable path, which would otherwise produce an unwritable metrics path.
+sanitize_proc_name() {
+  printf '%s' "${1##*/}" | tr -c 'A-Za-z0-9._-' '-' | sed 's/-*$//'
+}
+
+# Reject a user-supplied process name that cannot be used safely
+#
+# Auto-detected names are sanitized silently, but a name the user typed is
+# rejected outright: silently rewriting "my app" to "my-app" would make the
+# --name they chose disagree with the key in benchmark.json.
+#
+# Args: $1 = name (may be empty, meaning "auto-detect"), $2 = flag for messages
+validate_proc_name() {
+  [ -z "$1" ] && return 0
+  if [ "$1" != "$(sanitize_proc_name "$1")" ]; then
+    error "$2 name must contain only letters, digits, '.', '_' or '-' (got: $1)"
+  fi
+  return 0
+}
+
+# Test whether a name is already present in a space-separated list
+#
+# Why not `grep -w`: -w treats '-' as a word boundary, so "app" matches
+# "app-2", and the needle is a regex, so "node.js" matches "nodeXjs". Both
+# produce bogus duplicate errors. Pattern matching on padded strings compares
+# the whole token literally.
+#
+# Args: $1 = name, $2 = space-separated list of seen names
+name_is_seen() {
+  case " $2 " in
+    *" $1 "*) return 0 ;;
+  esac
+  return 1
 }
 
 # Generate auto-name from command
@@ -344,12 +443,13 @@ main() {
         if [ "$1" -le 0 ]; then
           error "--runs must be a positive number (at least 1)"
         fi
-        # Pre-flight disk space check for large runs (estimate 10MB per run)
+        # Pre-flight disk space check for large runs.
+        # Estimate ~10 KB per run (a log, a stdout/stderr pair and a JSON line);
+        # the arithmetic below is runs * 10240 / 1000 KB, i.e. ~10 KB each.
         if [ "$1" -gt 10000 ]; then
           # Get available disk space in KB
           available_kb=$(df -k . 2>/dev/null | awk 'NR==2 {print $4}')
           if [ -n "$available_kb" ]; then
-            # Estimate needed: runs * 10MB = runs * 10240 KB
             needed_kb=$((${1} * 10240 / 1000))
             if [ "$available_kb" -lt "$needed_kb" ]; then
               error "Insufficient disk space for $1 runs (need ~$((needed_kb / 1024))MB, have ~$((available_kb / 1024))MB)"
@@ -368,6 +468,17 @@ main() {
         if [ "${#1}" -gt 255 ]; then
           error "--name must be 255 characters or less"
         fi
+        # NAME becomes a directory under ./bench-results/, so it must stay a
+        # single path component. Without this, --name ../../x escapes the
+        # results tree and writes wherever the caller can reach.
+        case "$1" in
+          */*)
+            error "--name cannot contain '/'"
+            ;;
+          .|..)
+            error "--name cannot be '.' or '..'"
+            ;;
+        esac
         NAME="$1"
         shift
         ;;
@@ -411,6 +522,7 @@ main() {
             error "--pid requires a numeric PID (got: $proc_pid)"
             ;;
         esac
+        validate_proc_name "$proc_name" "--pid"
         # Add to monitor list (name:pid:port format, port empty for --pid)
         MONITOR_PROCESSES="$MONITOR_PROCESSES $proc_name:$proc_pid:"
         shift
@@ -439,6 +551,7 @@ main() {
             error "--port requires a numeric port (got: $proc_port)"
             ;;
         esac
+        validate_proc_name "$proc_name" "--port"
         # Resolve port to PID
         resolved_pid=$(resolve_port_to_pid "$proc_port")
         if [ -z "$resolved_pid" ]; then
@@ -509,19 +622,22 @@ main() {
 
       # Auto-detect name if not provided
       if [ -z "$proc_name" ]; then
-        proc_name=$(get_process_name "$proc_pid")
+        proc_name=$(sanitize_proc_name "$(get_process_name "$proc_pid")")
         if [ -z "$proc_name" ]; then
           proc_name="process-$proc_pid"
         fi
-        # Handle duplicate auto-detected names by appending suffix
+        # Handle duplicate auto-detected names by appending suffix.
+        # The counter restarts per process so suffixes stay predictable
+        # (app, app-2, app-3) instead of depending on earlier entries.
         base_name="$proc_name"
-        while echo "$seen_names" | grep -qw "$proc_name"; do
+        name_counter=1
+        while name_is_seen "$proc_name" "$seen_names"; do
           name_counter=$((name_counter + 1))
           proc_name="${base_name}-${name_counter}"
         done
       else
         # Check for duplicate user-provided names
-        if echo "$seen_names" | grep -qw "$proc_name"; then
+        if name_is_seen "$proc_name" "$seen_names"; then
           error "Duplicate process name: $proc_name"
         fi
       fi
@@ -567,9 +683,10 @@ main() {
 
   # Run benchmark loop
   run_num=1
-  times_file=$(mktemp)
-  exit_codes_file=$(mktemp)
-  runs_file=$(mktemp)
+  # Global so that cleanup() can reclaim them on any exit path
+  TIMES_FILE=$(mktemp)
+  EXIT_CODES_FILE=$(mktemp)
+  RUNS_FILE=$(mktemp)
 
   # Capture initial metrics for all monitored processes (for leak detection)
   initial_metrics=""
@@ -673,11 +790,11 @@ main() {
     if [ -n "$processes_json" ]; then
       processes_field=",\"processes\":{$processes_json}"
     fi
-    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$processes_field}" >> "$runs_file"
+    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$processes_field}" >> "$RUNS_FILE"
 
     # Store results for statistics
-    echo "$duration_ms" >> "$times_file"
-    echo "$cmd_exit" >> "$exit_codes_file"
+    echo "$duration_ms" >> "$TIMES_FILE"
+    echo "$cmd_exit" >> "$EXIT_CODES_FILE"
 
     RUNS_COMPLETED=$run_num
     run_num=$((run_num + 1))
@@ -699,19 +816,19 @@ main() {
     else
       runs_failed=$((runs_failed + 1))
     fi
-  done < "$exit_codes_file"
+  done < "$EXIT_CODES_FILE"
 
   # Calculate timing statistics
   if [ "$RUNS_COMPLETED" -gt 0 ]; then
     # Sort times for median/percentiles
-    sorted_times=$(sort -n "$times_file")
+    sorted_times=$(sort -n "$TIMES_FILE")
 
     # Min/Max
     time_min=$(echo "$sorted_times" | head -1)
     time_max=$(echo "$sorted_times" | tail -1)
 
     # Mean
-    time_sum=$(awk '{sum+=$1} END {printf "%.6f", sum}' "$times_file")
+    time_sum=$(awk '{sum+=$1} END {printf "%.6f", sum}' "$TIMES_FILE")
     time_mean=$(bc_normalize "scale=6; $time_sum / $RUNS_COMPLETED")
 
     # Median
@@ -727,7 +844,7 @@ main() {
     # Standard deviation (sample stddev with n-1 denominator)
     # Formula: sqrt(sum((x - mean)^2) / (n - 1))
     if [ "$RUNS_COMPLETED" -gt 1 ]; then
-      sum_sq_diff=$(awk -v mean="$time_mean" '{diff=$1-mean; sum+=diff*diff} END {printf "%.6f", sum}' "$times_file")
+      sum_sq_diff=$(awk -v mean="$time_mean" '{diff=$1-mean; sum+=diff*diff} END {printf "%.6f", sum}' "$TIMES_FILE")
       time_stddev=$(bc_normalize "scale=6; sqrt($sum_sq_diff / ($RUNS_COMPLETED - 1))")
     else
       time_stddev=0
@@ -866,30 +983,29 @@ main() {
   ]"
   fi
 
-  # Build runs array from temp file
-  runs_json="["
-  first=1
-  while IFS= read -r line; do
-    if [ "$first" -eq 1 ]; then
-      first=0
-    else
-      runs_json="$runs_json,"
-    fi
-    runs_json="$runs_json
-    $line"
-  done < "$runs_file"
-  runs_json="$runs_json
-  ]"
+  # Escape every user-controlled string exactly once, here, rather than at
+  # each interpolation site. Process names are already restricted to a
+  # JSON-safe character set by sanitize_proc_name/validate_proc_name.
+  name_json=$(json_escape "$NAME")
+  message_json=$(json_escape "$MESSAGE")
+  command_json=$(json_escape "$COMMAND")
+  os_json=$(json_escape "$(uname -s)")
+  shell_json=$(json_escape "$SHELL")
+  pwd_json=$(json_escape "$PWD")
 
-  # Generate JSON output
+  # Generate JSON output.
+  #
+  # Written in three appends (header, runs array, tail) so the runs array is
+  # streamed straight from the temp file. Accumulating it in a shell variable
+  # re-copied the whole string once per run, which is quadratic in --runs.
   cat > "$OUTPUT_DIR/benchmark.json" << ENDJSON
 {
   "schema_version": "$SCHEMA_VERSION",
   "tool": "bench",
   "tool_version": "$VERSION",
-  "name": "$NAME",
-  "message": "$MESSAGE",
-  "command": "$COMMAND",
+  "name": "$name_json",
+  "message": "$message_json",
+  "command": "$command_json",
   "runs_requested": $RUNS,
   "runs_completed": $RUNS_COMPLETED,
   "runs_successful": $runs_successful,
@@ -907,16 +1023,24 @@ main() {
     "p99": $time_p99
   },
   "environment": {
-    "os": "$(uname -s)",
-    "shell": "$SHELL",
-    "pwd": "$PWD"
+    "os": "$os_json",
+    "shell": "$shell_json",
+    "pwd": "$pwd_json"
   },
-  "runs": $runs_json$processes_json
+  "runs": [
+ENDJSON
+
+  # Stream the per-run objects (one JSON object per line in $RUNS_FILE)
+  awk '{ if (NR > 1) printf ",\n"; printf "    %s", $0 }
+       END { if (NR > 0) printf "\n" }' "$RUNS_FILE" >> "$OUTPUT_DIR/benchmark.json"
+
+  cat >> "$OUTPUT_DIR/benchmark.json" << ENDJSON
+  ]$processes_json
 }
 ENDJSON
 
   # Cleanup temp files
-  rm -f "$times_file" "$exit_codes_file" "$runs_file"
+  cleanup
 
   # Output absolute path
   (cd "$OUTPUT_DIR" && pwd)
