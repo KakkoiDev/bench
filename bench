@@ -43,8 +43,8 @@
 
 set -e
 
-VERSION="2.2.0"
-SCHEMA_VERSION="2.0"
+VERSION="2.3.0"
+SCHEMA_VERSION="2.1"
 
 # Global state for signal handling
 INTERRUPTED=0
@@ -56,6 +56,10 @@ SAMPLER_PID=""
 TIMES_FILE=""
 EXIT_CODES_FILE=""
 RUNS_FILE=""
+MEASUREMENTS_FILE=""
+INGEST_PL=""
+AGGREGATE_PL=""
+REQUIRE_FILE=""
 
 # Release resources that would otherwise outlive the script.
 #
@@ -72,6 +76,10 @@ cleanup() {
   [ -n "$TIMES_FILE" ] && rm -f "$TIMES_FILE"
   [ -n "$EXIT_CODES_FILE" ] && rm -f "$EXIT_CODES_FILE"
   [ -n "$RUNS_FILE" ] && rm -f "$RUNS_FILE"
+  [ -n "$MEASUREMENTS_FILE" ] && rm -f "$MEASUREMENTS_FILE"
+  [ -n "$INGEST_PL" ] && rm -f "$INGEST_PL"
+  [ -n "$AGGREGATE_PL" ] && rm -f "$AGGREGATE_PL"
+  [ -n "$REQUIRE_FILE" ] && rm -f "$REQUIRE_FILE"
   return 0
 }
 trap 'cleanup' EXIT
@@ -105,6 +113,16 @@ Options:
   --port [NAME:]PORT  Monitor process by port (repeatable)
   --metrics-interval MS  Metrics sampling interval (default: 500, min: 100)
 
+  --evaluate CMD      Independently validate each run; receives the run
+                      directory as $1 and in $BENCH_RUN_DIR
+  --expect-exit CODE  Exit code the command must return, or "any"
+                      (default: 0)
+  --require EXPR      Hard constraint on a metric, e.g. "errors == 0"
+                      (repeatable)
+  --require-artifact PATH
+                      Artifact that must exist under the run directory
+                      (repeatable)
+
   --help              Show help
   --version           Show version
 
@@ -113,6 +131,15 @@ Examples:
   bench --runs 20 --name "api-v1" --message "baseline" "curl localhost/api"
   bench --pid 12345 --pid 67890 "curl localhost:8080"
   bench --pid app:12345 --port redis:6379 "curl localhost:8080"
+  bench --evaluate ./grade.sh --require "errors == 0" ./run-agent.sh
+
+Evidence protocol:
+  Each run gets a directory, exported as $BENCH_RUN_DIR. A command may write:
+    $BENCH_RUN_DIR/result.json    {"metrics":{...},"artifacts":[...],"valid":true}
+    $BENCH_RUN_DIR/metrics.jsonl  {"type":"metric","name":"tokens","value":1420}
+    $BENCH_RUN_DIR/artifacts/     files produced by the run
+  Metric values must be finite numbers. A command declaring itself valid does
+  not make a run valid; only an evaluator can do that.
 
 Naming:
   Process names may contain letters, digits, '.', '_' and '-'
@@ -235,6 +262,439 @@ name_is_seen() {
   return 1
 }
 
+# =============================================================================
+# EVIDENCE PROTOCOL (schema 2.1)
+# =============================================================================
+#
+# A benchmarked command, and an optional independent evaluator, may emit
+# measurements and register files as evidence. Both write into the per-run
+# evidence directory that bench creates and exports as $BENCH_RUN_DIR:
+#
+#   $BENCH_RUN_DIR/result.json    a single result object
+#   $BENCH_RUN_DIR/metrics.jsonl  streaming JSON Lines events
+#   $BENCH_RUN_DIR/artifacts/     files the command produced
+#
+# Neither file is required. A command that writes nothing behaves exactly as
+# it did under schema 2.0.
+#
+# Why files rather than stdout? stdout is the command's own output and is
+# preserved verbatim as evidence; multiplexing a control channel onto it
+# would corrupt that and break commands that emit binary data.
+#
+# Why parse with Perl? perl is already a hard dependency, and JSON::PP has
+# been core since 5.14. Parsing JSON with sed/grep is how the schema 2.0
+# writer produced unparseable output in the first place; an evidence format
+# has to be read by a real parser.
+
+# Write the ingest helper to a temp file
+#
+# Kept as a file rather than an inline `perl -e` string so the Perl source can
+# use quotes freely without shell quoting hazards.
+write_ingest_helper() {
+  INGEST_PL=$(mktemp)
+  cat > "$INGEST_PL" << 'INGEST_EOF'
+#!/usr/bin/perl
+# Read and validate the evidence emitted by one run.
+#
+# Usage: ingest.pl <result.json> <metrics.jsonl> <label> [<out.json>]
+#
+# Emits a tab-separated line protocol on stdout for the shell to consume:
+#   METRIC   <name> <value> <unit>
+#   ARTIFACT <path>
+#   EVIDENCE <path>
+#   VALID    <0|1>
+#   RAW      <canonical JSON of the result object>
+#   JSON     <compact evidence object, ready to splice into benchmark.json>
+#
+# When <out.json> is given, the same evidence object is also written there as
+# a standalone, self-describing document.
+#
+# Validation errors go to stderr, one per line, and exit status is 1.
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($result_path, $jsonl_path, $label, $out_path) = @ARGV;
+$label = defined $label ? $label : 'result';
+
+my @errors;
+my (%metrics, %units, @order, @artifacts, @evidence);
+my $declared_valid;
+my $raw = 'null';
+my $source;          # the decoded result object, kept verbatim
+
+sub fail { push @errors, $_[0]; }
+
+sub show {
+  my ($v) = @_;
+  return 'null' unless defined $v;
+  return '<object>' if ref $v eq 'HASH';
+  return '<array>'  if ref $v eq 'ARRAY';
+  return $v ? 'true' : 'false' if JSON::PP::is_bool($v);
+  my $s = "$v";
+  $s = substr($s, 0, 40) . '...' if length($s) > 43;
+  return $s;
+}
+
+# Metric names must be stable identifiers: they become JSON object keys and
+# are matched across runs, so a name that varies per run is a bug, not data.
+sub check_name {
+  my ($n) = @_;
+  return 0 unless defined $n && !ref $n && length $n;
+  return 0 if JSON::PP::is_bool($n);
+  return $n =~ /^[A-Za-z_][A-Za-z0-9_.-]*$/ ? 1 : 0;
+}
+
+# Values must be finite numbers. JSON itself has no NaN or Infinity literal,
+# but 1e999 parses to Inf, so the result is range-checked rather than trusted.
+sub check_num {
+  my ($v) = @_;
+  return undef if !defined $v || ref $v;
+  return undef if JSON::PP::is_bool($v);
+  return undef unless "$v" =~ /^\s*-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*$/;
+  my $n = $v + 0;
+  return undef if $n != $n;                          # NaN
+  my $inf = 9**9**9;
+  return undef if $n == $inf || $n == -$inf;         # +/- Infinity
+  return $n;
+}
+
+# Registered paths stay inside the run directory: they are copied, compared
+# and shipped as evidence, so absolute paths and traversal are refused.
+sub check_path {
+  my ($p) = @_;
+  return (0, 'must be a non-empty string') unless defined $p && !ref $p && length $p;
+  return (0, 'must be a non-empty string') if JSON::PP::is_bool($p);
+  return (0, 'must not contain tabs or newlines') if $p =~ /[\t\n\r]/;
+  return (0, 'must be relative to the run directory') if $p =~ m{^/};
+  return (0, 'must not escape the run directory') if $p =~ m{(?:^|/)\.\.(?:/|$)};
+  return (1, '');
+}
+
+sub add_metric {
+  my ($name, $value, $unit, $where) = @_;
+  unless (check_name($name)) {
+    fail("$where: invalid metric name " . show($name)
+       . " (expected a name matching [A-Za-z_][A-Za-z0-9_.-]*)");
+    return;
+  }
+  my $n = check_num($value);
+  unless (defined $n) {
+    fail("$where: metric '$name' must be a finite number (got " . show($value) . ")");
+    return;
+  }
+  if (defined $unit && !(ref $unit) && !JSON::PP::is_bool($unit)) {
+    unless ($unit =~ m{^[A-Za-z0-9_./%-]{1,32}$}) {
+      fail("$where: metric '$name' has an invalid unit " . show($unit));
+      return;
+    }
+    # A metric that changes unit mid-run cannot be aggregated meaningfully
+    if (exists $units{$name} && $units{$name} ne $unit) {
+      fail("$where: metric '$name' changed unit within the run "
+         . "('$units{$name}' then '$unit')");
+      return;
+    }
+    $units{$name} = $unit;
+  } elsif (defined $unit) {
+    fail("$where: metric '$name' has an invalid unit " . show($unit));
+    return;
+  }
+  push @order, $name unless exists $metrics{$name};
+  $metrics{$name} = $n;
+}
+
+sub add_path {
+  my ($list, $p, $where, $kind) = @_;
+  my ($ok, $why) = check_path($p);
+  unless ($ok) {
+    fail("$where: $kind path " . show($p) . " $why");
+    return;
+  }
+  push @$list, $p unless grep { $_ eq $p } @$list;
+}
+
+sub set_valid {
+  my ($v, $where) = @_;
+  if (JSON::PP::is_bool($v)) { $declared_valid = $v ? 1 : 0; return; }
+  fail("$where: 'valid' must be true or false (got " . show($v) . ")");
+}
+
+sub slurp {
+  my ($path) = @_;
+  open my $fh, '<', $path or do { fail("cannot read $path: $!"); return undef; };
+  local $/;
+  my $txt = <$fh>;
+  close $fh;
+  return defined $txt ? $txt : '';
+}
+
+# ---- result.json: a single object -------------------------------------------
+if (defined $result_path && -e $result_path) {
+  my $txt = slurp($result_path);
+  if (defined $txt && $txt =~ /\S/) {
+    my $data = eval { JSON::PP->new->decode($txt) };
+    if ($@) {
+      my $e = $@; $e =~ s/\s+at\s+\S+\s+line\s+\d+\.?\s*$//s; $e =~ s/\s+/ /g;
+      fail("$label: invalid JSON ($e)");
+    } elsif (ref $data ne 'HASH') {
+      fail("$label: top level must be a JSON object");
+    } else {
+      # Preserved verbatim so fields this version does not understand survive
+      $raw = JSON::PP->new->canonical->encode($data);
+      $source = $data;
+
+      if (exists $data->{metrics}) {
+        if (ref $data->{metrics} ne 'HASH') {
+          fail("$label: 'metrics' must be an object mapping names to numbers");
+        } else {
+          my $u = $data->{units};
+          $u = {} unless ref $u eq 'HASH';
+          for my $k (sort keys %{ $data->{metrics} }) {
+            add_metric($k, $data->{metrics}{$k}, $u->{$k}, $label);
+          }
+        }
+      }
+      for my $pair (['artifacts', \@artifacts], ['evidence', \@evidence]) {
+        my ($key, $list) = @$pair;
+        next unless exists $data->{$key};
+        if (ref $data->{$key} ne 'ARRAY') {
+          fail("$label: '$key' must be an array of relative paths");
+          next;
+        }
+        add_path($list, $_, $label, $key) for @{ $data->{$key} };
+      }
+      set_valid($data->{valid}, $label) if exists $data->{valid};
+    }
+  }
+}
+
+# ---- metrics.jsonl: one event per line --------------------------------------
+if (defined $jsonl_path && -e $jsonl_path) {
+  if (open my $fh, '<', $jsonl_path) {
+    my $ln = 0;
+    while (my $line = <$fh>) {
+      $ln++;
+      next unless $line =~ /\S/;
+      my $where = "$label stream line $ln";
+      my $ev = eval { JSON::PP->new->decode($line) };
+      if ($@) { fail("$where: invalid JSON"); next; }
+      if (ref $ev ne 'HASH') { fail("$where: each line must be a JSON object"); next; }
+      my $t = $ev->{type};
+      if (!defined $t || ref $t) { fail("$where: missing 'type'"); next; }
+      if    ($t eq 'metric')   { add_metric($ev->{name}, $ev->{value}, $ev->{unit}, $where); }
+      elsif ($t eq 'artifact') { add_path(\@artifacts, $ev->{path}, $where, 'artifact'); }
+      elsif ($t eq 'evidence') { add_path(\@evidence,  $ev->{path}, $where, 'evidence'); }
+      elsif ($t eq 'valid')    { set_valid($ev->{value}, $where); }
+      else { fail("$where: unknown event type '$t' "
+                . "(expected metric, artifact, evidence or valid)"); }
+    }
+    close $fh;
+  } else {
+    fail("cannot read $jsonl_path: $!");
+  }
+}
+
+if (@errors) {
+  print STDERR "$_\n" for @errors;
+  exit 1;
+}
+
+for my $n (@order) {
+  my $u = defined $units{$n} ? $units{$n} : '';
+  print "METRIC\t$n\t$metrics{$n}\t$u\n";
+}
+print "ARTIFACT\t$_\n" for @artifacts;
+print "EVIDENCE\t$_\n" for @evidence;
+print "VALID\t$declared_valid\n" if defined $declared_valid;
+print "RAW\t$raw\n";
+
+# Numbers are re-encoded from their numeric value so the emitted JSON carries
+# real numbers, not the strings they arrived as.
+my %m = map { $_ => $metrics{$_} + 0 } keys %metrics;
+my $evidence_obj = {
+  metrics        => \%m,
+  units          => \%units,
+  artifacts      => \@artifacts,
+  evidence       => \@evidence,
+  declared_valid => (defined $declared_valid
+                      ? ($declared_valid ? JSON::PP::true : JSON::PP::false)
+                      : undef),
+};
+my $enc = JSON::PP->new->canonical;
+print "JSON\t", $enc->encode($evidence_obj), "\n";
+
+if (defined $out_path && length $out_path) {
+  # "source" carries the command's original object unchanged, so fields this
+  # version of bench does not understand are still readable later.
+  my %doc = (%$evidence_obj, schema_version => '2.1', source => $source);
+  if (open my $out, '>', $out_path) {
+    print $out $enc->pretty->encode(\%doc);
+    close $out;
+  } else {
+    print STDERR "cannot write $out_path: $!\n";
+    exit 1;
+  }
+}
+exit 0;
+INGEST_EOF
+}
+
+# Write the aggregation helper to a temp file
+#
+# Aggregates raw per-run measurements into per-metric summaries. Kept in Perl
+# because it must emit JSON and compute statistics; doing either in shell is
+# what this schema exists to stop doing.
+write_aggregate_helper() {
+  AGGREGATE_PL=$(mktemp)
+  cat > "$AGGREGATE_PL" << 'AGG_EOF'
+#!/usr/bin/perl
+# Summarise raw measurements collected across runs.
+#
+# Usage: aggregate.pl <measurements.tsv>
+#   each line: <run>\t<name>\t<value>\t<unit>
+#
+# Prints the compact JSON object for the "metrics" field of benchmark.json.
+#
+# Every observed value is retained under "values". Outliers are never trimmed:
+# a summary that silently drops data is not evidence.
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($path) = @ARGV;
+my (%vals, %runs, %unit, @order, @errors);
+
+if (defined $path && -e $path && open my $fh, '<', $path) {
+  while (my $line = <$fh>) {
+    chomp $line;
+    next unless length $line;
+    my ($run, $name, $value, $u) = split /\t/, $line, 4;
+    next unless defined $name && defined $value;
+    $u = '' unless defined $u;
+    push @order, $name unless exists $vals{$name};
+    push @{ $vals{$name} }, $value + 0;
+    push @{ $runs{$name} }, $run + 0;
+    if (length $u) {
+      # A unit that disagrees between runs makes the values incomparable
+      if (exists $unit{$name} && $unit{$name} ne $u) {
+        push @errors, "metric '$name' has inconsistent units across runs "
+                    . "('$unit{$name}' and '$u')";
+      }
+      $unit{$name} = $u;
+    }
+  }
+  close $fh;
+}
+
+if (@errors) {
+  my %seen;
+  for (@errors) { next if $seen{$_}++; print STDERR "$_\n"; }
+  exit 1;
+}
+
+sub median {
+  my @s = sort { $a <=> $b } @{ $_[0] };
+  my $n = scalar @s;
+  return 0 unless $n;
+  return $n % 2 ? $s[ ($n - 1) / 2 ] : ($s[ $n / 2 - 1 ] + $s[ $n / 2 ]) / 2;
+}
+
+# Round to 6 decimals to keep JSON stable across platforms, then drop the
+# trailing zeros so whole numbers stay whole.
+sub num { return 0 + sprintf('%.6f', $_[0]); }
+
+my %out;
+for my $name (@order) {
+  my @v = @{ $vals{$name} };
+  my $n = scalar @v;
+  my ($min, $max, $sum) = ($v[0], $v[0], 0);
+  for my $x (@v) {
+    $min = $x if $x < $min;
+    $max = $x if $x > $max;
+    $sum += $x;
+  }
+  my $mean = $sum / $n;
+  my $stddev = 0;
+  if ($n > 1) {
+    my $ss = 0;
+    $ss += ($_ - $mean) ** 2 for @v;
+    $stddev = sqrt($ss / ($n - 1));
+  }
+  my %entry = (
+    count  => $n,
+    min    => num($min),
+    max    => num($max),
+    mean   => num($mean),
+    median => num(median(\@v)),
+    stddev => num($stddev),
+    values => [ map { num($_) } @v ],
+    runs   => $runs{$name},
+  );
+  $entry{unit} = $unit{$name} if exists $unit{$name};
+  $out{$name} = \%entry;
+}
+
+print JSON::PP->new->canonical->encode(\%out), "\n";
+exit 0;
+AGG_EOF
+}
+
+# Evaluate one hard constraint against a run's measurements
+#
+# Grammar is deliberately tiny -- <metric> <op> <number> -- and is parsed, not
+# evaluated. Nothing from a result file or manifest reaches a shell or an
+# expression evaluator.
+#
+# Args: $1 = constraint, $2 = file of "name<TAB>value" lines
+# Returns: 0 satisfied, 1 violated, 2 metric absent
+check_constraint() {
+  _c_expr="$1"
+  _c_file="$2"
+  # shellcheck disable=SC2086
+  set -- $_c_expr
+  _c_name="$1"
+  _c_op="$2"
+  _c_want="$3"
+
+  _c_have=$(awk -F'\t' -v n="$_c_name" '$1 == n { print $2; found = 1 }
+                                        END { if (!found) exit 1 }' "$_c_file") || return 2
+
+  awk -v a="$_c_have" -v b="$_c_want" -v op="$_c_op" 'BEGIN {
+    a += 0; b += 0;
+    if (op == "==") ok = (a == b);
+    else if (op == "!=") ok = (a != b);
+    else if (op == "<")  ok = (a <  b);
+    else if (op == "<=") ok = (a <= b);
+    else if (op == ">")  ok = (a >  b);
+    else if (op == ">=") ok = (a >= b);
+    exit ok ? 0 : 1
+  }'
+}
+
+# Validate a constraint expression at parse time so a typo fails immediately
+# rather than after a long benchmark has already run.
+validate_constraint() {
+  _vc_orig="$1"
+  # shellcheck disable=SC2086
+  set -- $1
+  if [ $# -ne 3 ]; then
+    error "--require must be '<metric> <op> <number>' (got: $_vc_orig)"
+  fi
+  case "$1" in
+    ''|*[!A-Za-z0-9_.-]*|[!A-Za-z_]*)
+      error "--require metric name is invalid: $1"
+      ;;
+  esac
+  case "$2" in
+    '=='|'!='|'<'|'<='|'>'|'>=') ;;
+    *) error "--require operator must be one of == != < <= > >= (got: $2)" ;;
+  esac
+  case "$3" in
+    ''|*[!0-9.eE+-]*) error "--require right-hand side must be a number (got: $3)" ;;
+  esac
+  return 0
+}
+
 # Generate auto-name from command
 # Algorithm: Remove quotes/special chars → lowercase → spaces to dashes → remove consecutive dashes → truncate 50 → trim trailing dashes
 # Falls back to "benchmark" if result is empty (e.g., command is all special chars)
@@ -268,6 +728,12 @@ check_dependencies() {
   # Check for Time::HiRes module
   if ! perl -MTime::HiRes -e 'exit 0' 2>/dev/null; then
     error "Required Perl module 'Time::HiRes' not found. Please install libtime-hires-perl or equivalent."
+  fi
+
+  # Check for JSON::PP (core Perl since 5.14; used to parse and validate the
+  # evidence a benchmarked command emits)
+  if ! perl -MJSON::PP -e 'exit 0' 2>/dev/null; then
+    error "Required Perl module 'JSON::PP' not found. Please install libjson-pp-perl or equivalent."
   fi
 }
 
@@ -418,6 +884,10 @@ main() {
   MONITOR_PROCESSES=""  # Space-separated list of "name:pid:port" entries
   METRICS_INTERVAL=500  # Sampling interval in milliseconds
   COMMAND=""
+  EVALUATE_CMD=""
+  EXPECT_EXIT=0         # Exit code the command must return ("any" to accept all)
+  REQUIRE_FILE=""       # Temp file holding one --require expression per line
+  REQUIRE_ARTIFACTS=""  # Newline-separated required artifact paths
 
   # Parse arguments
   while [ $# -gt 0 ]; do
@@ -561,6 +1031,57 @@ main() {
         MONITOR_PROCESSES="$MONITOR_PROCESSES $proc_name:$resolved_pid:$proc_port"
         shift
         ;;
+      --evaluate)
+        shift
+        if [ -z "$1" ]; then
+          error "--evaluate requires a command"
+        fi
+        EVALUATE_CMD="$1"
+        shift
+        ;;
+      --expect-exit)
+        shift
+        if [ -z "$1" ]; then
+          error "--expect-exit requires an argument"
+        fi
+        if [ "$1" != "any" ]; then
+          case "$1" in
+            ''|*[!0-9]*)
+              error "--expect-exit requires a number or \"any\" (got: $1)"
+              ;;
+          esac
+          if [ "$1" -gt 255 ]; then
+            error "--expect-exit must be between 0 and 255 (got: $1)"
+          fi
+        fi
+        EXPECT_EXIT="$1"
+        shift
+        ;;
+      --require)
+        shift
+        if [ -z "$1" ]; then
+          error "--require requires an expression"
+        fi
+        validate_constraint "$1"
+        if [ -z "$REQUIRE_FILE" ]; then
+          REQUIRE_FILE=$(mktemp)
+        fi
+        printf '%s\n' "$1" >> "$REQUIRE_FILE"
+        shift
+        ;;
+      --require-artifact)
+        shift
+        if [ -z "$1" ]; then
+          error "--require-artifact requires a path"
+        fi
+        case "$1" in
+          /*) error "--require-artifact must be relative to the run directory (got: $1)" ;;
+          *..*) error "--require-artifact must not escape the run directory (got: $1)" ;;
+        esac
+        REQUIRE_ARTIFACTS="$REQUIRE_ARTIFACTS$1
+"
+        shift
+        ;;
       --metrics-interval)
         shift
         if [ -z "$1" ]; then
@@ -687,6 +1208,19 @@ main() {
   TIMES_FILE=$(mktemp)
   EXIT_CODES_FILE=$(mktemp)
   RUNS_FILE=$(mktemp)
+  MEASUREMENTS_FILE=$(mktemp)
+  write_ingest_helper
+  write_aggregate_helper
+
+  # Per-run validity tallies (schema 2.1)
+  runs_valid=0
+  status_ok=0
+  status_command_failed=0
+  status_invalid_result=0
+  status_declared_invalid=0
+  status_evaluator_failed=0
+  status_constraint_failed=0
+  status_infrastructure_failed=0
 
   # Capture initial metrics for all monitored processes (for leak detection)
   initial_metrics=""
@@ -729,7 +1263,29 @@ main() {
     # Capture stdout and stderr separately
     stdout_file="$OUTPUT_DIR/runs/${run_num}.stdout"
     stderr_file="$OUTPUT_DIR/runs/${run_num}.stderr"
-    sh -c "$COMMAND" > "$stdout_file" 2> "$stderr_file" &
+
+    # Per-run evidence directory (schema 2.1). The command writes its
+    # measurements and artifacts here; bench writes the normalised result
+    # alongside them, so the directory is readable without bench.
+    run_dir="$OUTPUT_DIR/runs/${run_num}"
+    run_status="ok"
+    run_error=""
+    if ! mkdir -p "$run_dir/artifacts" 2>/dev/null; then
+      run_status="infrastructure_failed"
+      run_error="could not create run directory"
+    fi
+    # An in-flight run is marked incomplete until its record is written, so a
+    # run interrupted partway through is visibly unfinished on disk rather
+    # than looking like a run that simply produced no evidence.
+    : > "$run_dir/INCOMPLETE"
+
+    BENCH_RUN_DIR="$run_dir" \
+    BENCH_RESULT_JSON="$run_dir/result.json" \
+    BENCH_METRICS="$run_dir/metrics.jsonl" \
+    BENCH_ARTIFACTS="$run_dir/artifacts" \
+    BENCH_RUN_NUMBER="$run_num" \
+    BENCH_RUNS="$RUNS" \
+      sh -c "$COMMAND" > "$stdout_file" 2> "$stderr_file" &
     cmd_pid=$!
     wait $cmd_pid 2>/dev/null
     cmd_exit=$?
@@ -785,12 +1341,163 @@ main() {
       done
     fi
 
+    # -------------------------------------------------------------------------
+    # Evidence, evaluation and validity (schema 2.1)
+    #
+    # Order matters and is what makes the distinction between failure classes
+    # meaningful: a command that never met its exit requirement is not
+    # "constraint_failed", and an evaluator is not asked to grade a run that
+    # did not happen.
+    # -------------------------------------------------------------------------
+
+    # 1. Exit requirement
+    if [ "$run_status" = "ok" ] && [ "$EXPECT_EXIT" != "any" ] \
+       && [ "$cmd_exit" -ne "$EXPECT_EXIT" ]; then
+      run_status="command_failed"
+      run_error="command exited $cmd_exit (expected $EXPECT_EXIT)"
+    fi
+
+    # 2. Ingest whatever the command emitted.
+    #    Done even for a failed command: measurements from a failed run are
+    #    still evidence, and discarding them hides why it failed.
+    ingest_err="$run_dir/.ingest.err"
+    evidence_json='{"artifacts":[],"declared_valid":null,"evidence":[],"metrics":{},"units":{}}'
+    run_metrics_tsv="$run_dir/.metrics.tsv"
+    : > "$run_metrics_tsv"
+    declared_valid=""
+    if ingest_out=$(perl "$INGEST_PL" "$run_dir/result.json" "$run_dir/metrics.jsonl" \
+                         "run $run_num" "$run_dir/metrics.json" 2>"$ingest_err"); then
+      evidence_json=$(printf '%s\n' "$ingest_out" | sed -n 's/^JSON\t//p')
+      printf '%s\n' "$ingest_out" | while IFS="$(printf '\t')" read -r kind a b c; do
+        case "$kind" in
+          METRIC)
+            printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$MEASUREMENTS_FILE"
+            printf '%s\t%s\n' "$a" "$b" >> "$run_metrics_tsv"
+            ;;
+        esac
+      done
+      declared_valid=$(printf '%s\n' "$ingest_out" | sed -n 's/^VALID\t//p')
+    else
+      if [ "$run_status" = "ok" ]; then
+        run_status="invalid_result"
+        run_error=$(tr '\n' ';' < "$ingest_err" | sed 's/;$//; s/;/; /g')
+      fi
+    fi
+    rm -f "$ingest_err"
+
+    # 3. A subject may veto itself, but may not vouch for itself.
+    #    "valid": true is recorded and otherwise ignored -- only an evaluator
+    #    can establish validity.
+    if [ "$run_status" = "ok" ] && [ "$declared_valid" = "0" ]; then
+      run_status="declared_invalid"
+      run_error="the command reported \"valid\": false"
+    fi
+
+    # 4. Independent evaluation
+    evaluation_json="null"
+    if [ -n "$EVALUATE_CMD" ] && [ "$run_status" = "ok" ]; then
+      eval_stdout="$run_dir/evaluator.stdout"
+      eval_stderr="$run_dir/evaluator.stderr"
+      BENCH_RUN_DIR="$run_dir" \
+      BENCH_RESULT_JSON="$run_dir/evaluation.json" \
+      BENCH_METRICS="$run_dir/evaluation.jsonl" \
+      BENCH_ARTIFACTS="$run_dir/artifacts" \
+      BENCH_RUN_NUMBER="$run_num" \
+      BENCH_EXIT_CODE="$cmd_exit" \
+      BENCH_STDOUT="$stdout_file" \
+      BENCH_STDERR="$stderr_file" \
+        sh -c "$EVALUATE_CMD \"\$1\"" bench "$run_dir" \
+          > "$eval_stdout" 2> "$eval_stderr"
+      eval_exit=$?
+
+      eval_valid="null"
+      if [ "$eval_exit" -ne 0 ]; then
+        run_status="evaluator_failed"
+        run_error="evaluator exited $eval_exit"
+      else
+        eval_err="$run_dir/.eval.err"
+        if eval_out=$(perl "$INGEST_PL" "$run_dir/evaluation.json" "$run_dir/evaluation.jsonl" \
+                           "run $run_num evaluation" "$run_dir/evaluation.metrics.json" 2>"$eval_err"); then
+          printf '%s\n' "$eval_out" | while IFS="$(printf '\t')" read -r kind a b c; do
+            case "$kind" in
+              METRIC)
+                printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$MEASUREMENTS_FILE"
+                printf '%s\t%s\n' "$a" "$b" >> "$run_metrics_tsv"
+                ;;
+            esac
+          done
+          eval_declared=$(printf '%s\n' "$eval_out" | sed -n 's/^VALID\t//p')
+          if [ "$eval_declared" = "0" ]; then
+            eval_valid="false"
+            run_status="evaluator_failed"
+            run_error="evaluator reported \"valid\": false"
+          elif [ "$eval_declared" = "1" ]; then
+            eval_valid="true"
+          fi
+        else
+          run_status="invalid_result"
+          run_error=$(tr '\n' ';' < "$eval_err" | sed 's/;$//; s/;/; /g')
+        fi
+        rm -f "$eval_err"
+      fi
+      evaluation_json="{\"exit_code\":$eval_exit,\"valid\":$eval_valid}"
+    fi
+
+    # 5. Hard constraints and required artifacts
+    if [ "$run_status" = "ok" ] && [ -n "$REQUIRE_FILE" ]; then
+      while IFS= read -r constraint; do
+        [ -n "$constraint" ] || continue
+        check_constraint "$constraint" "$run_metrics_tsv"
+        case $? in
+          1)
+            run_status="constraint_failed"
+            run_error="constraint failed: $constraint"
+            break
+            ;;
+          2)
+            run_status="constraint_failed"
+            run_error="constraint references a metric the run did not report: $constraint"
+            break
+            ;;
+        esac
+      done < "$REQUIRE_FILE"
+    fi
+    if [ "$run_status" = "ok" ] && [ -n "$REQUIRE_ARTIFACTS" ]; then
+      printf '%s' "$REQUIRE_ARTIFACTS" | while IFS= read -r want; do
+        [ -n "$want" ] || continue
+        [ -e "$run_dir/$want" ] || [ -e "$run_dir/artifacts/$want" ] || exit 1
+      done || {
+        run_status="constraint_failed"
+        run_error="a required artifact is missing"
+      }
+    fi
+    rm -f "$run_metrics_tsv"
+
+    # Tally
+    case "$run_status" in
+      ok)                     status_ok=$((status_ok + 1)); runs_valid=$((runs_valid + 1)) ;;
+      command_failed)         status_command_failed=$((status_command_failed + 1)) ;;
+      invalid_result)         status_invalid_result=$((status_invalid_result + 1)) ;;
+      declared_invalid)       status_declared_invalid=$((status_declared_invalid + 1)) ;;
+      evaluator_failed)       status_evaluator_failed=$((status_evaluator_failed + 1)) ;;
+      constraint_failed)      status_constraint_failed=$((status_constraint_failed + 1)) ;;
+      infrastructure_failed)  status_infrastructure_failed=$((status_infrastructure_failed + 1)) ;;
+    esac
+
+    run_valid_json=$([ "$run_status" = "ok" ] && echo "true" || echo "false")
+    run_error_json=$(json_escape "$run_error")
+
     # Store per-run data as JSON line
     processes_field=""
     if [ -n "$processes_json" ]; then
       processes_field=",\"processes\":{$processes_json}"
     fi
-    echo "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes$processes_field}" >> "$RUNS_FILE"
+    # printf, not echo: dash's builtin echo interprets backslash escapes, which
+    # would collapse the \\ that json_escape emits and produce invalid JSON.
+    printf '%s\n' "{\"run_number\":$run_num,\"exit_code\":$cmd_exit,\"status\":\"$run_status\",\"valid\":$run_valid_json,\"error\":\"$run_error_json\",\"start\":\"$start_iso\",\"end\":\"$end_iso\",\"duration_seconds\":$duration_sec,\"duration_ms\":$duration_ms,\"stdout_bytes\":$stdout_bytes,\"stderr_bytes\":$stderr_bytes,\"evidence\":$evidence_json,\"evaluation\":$evaluation_json$processes_field}" >> "$RUNS_FILE"
+
+    # The run is now fully recorded
+    rm -f "$run_dir/INCOMPLETE"
 
     # Store results for statistics
     echo "$duration_ms" >> "$TIMES_FILE"
@@ -983,12 +1690,36 @@ main() {
   ]"
   fi
 
+  # Aggregate raw per-run measurements into per-metric summaries.
+  # A unit conflict across runs is fatal: it means two different quantities
+  # were recorded under one name, and any summary of them would be wrong.
+  metrics_json="{}"
+  if [ -s "$MEASUREMENTS_FILE" ]; then
+    agg_err=$(mktemp)
+    if aggregated=$(perl "$AGGREGATE_PL" "$MEASUREMENTS_FILE" 2>"$agg_err"); then
+      metrics_json="$aggregated"
+      rm -f "$agg_err"
+    else
+      agg_msg=$(tr '\n' ';' < "$agg_err" | sed 's/;$//; s/;/; /g')
+      rm -f "$agg_err"
+      error "$agg_msg"
+    fi
+  fi
+
+  runs_invalid=$((RUNS_COMPLETED - runs_valid))
+  if [ "$RUNS_COMPLETED" -gt 0 ]; then
+    valid_rate=$(bc_normalize "scale=2; $runs_valid * 100 / $RUNS_COMPLETED")
+  else
+    valid_rate=0
+  fi
+
   # Escape every user-controlled string exactly once, here, rather than at
   # each interpolation site. Process names are already restricted to a
   # JSON-safe character set by sanitize_proc_name/validate_proc_name.
   name_json=$(json_escape "$NAME")
   message_json=$(json_escape "$MESSAGE")
   command_json=$(json_escape "$COMMAND")
+  evaluate_json=$(json_escape "$EVALUATE_CMD")
   os_json=$(json_escape "$(uname -s)")
   shell_json=$(json_escape "$SHELL")
   pwd_json=$(json_escape "$PWD")
@@ -1011,6 +1742,21 @@ main() {
   "runs_successful": $runs_successful,
   "runs_failed": $runs_failed,
   "success_rate": $success_rate,
+  "runs_valid": $runs_valid,
+  "runs_invalid": $runs_invalid,
+  "valid_rate": $valid_rate,
+  "evaluator": "$evaluate_json",
+  "expect_exit": "$EXPECT_EXIT",
+  "validity": {
+    "ok": $status_ok,
+    "command_failed": $status_command_failed,
+    "invalid_result": $status_invalid_result,
+    "declared_invalid": $status_declared_invalid,
+    "evaluator_failed": $status_evaluator_failed,
+    "constraint_failed": $status_constraint_failed,
+    "infrastructure_failed": $status_infrastructure_failed
+  },
+  "metrics": $metrics_json,
   "interrupted": $([ "$INTERRUPTED" -eq 1 ] && echo "true" || echo "false"),
   "timing": {
     "unit": "milliseconds",

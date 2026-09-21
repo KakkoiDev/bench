@@ -134,6 +134,10 @@ Options:
   --pid [NAME:]PID    Monitor process CPU/memory by PID (repeatable)
   --port [NAME:]PORT  Monitor process by port (repeatable)
   --metrics-interval MS  Metrics sampling interval (default: 500, min: 100)
+  --evaluate CMD      Independently validate each run (receives the run dir)
+  --expect-exit CODE  Exit code the command must return, or "any" (default: 0)
+  --require EXPR      Hard constraint on a metric, e.g. "errors == 0"
+  --require-artifact PATH   Artifact that must exist after the run
   --help              Show help
   --version           Show version
 ```
@@ -156,6 +160,14 @@ runs/
   1.stdout            # raw stdout
   1.stderr            # raw stderr
   1.app.metrics       # CPU/memory samples (format: "timestamp cpu:% mem:MB")
+  1/                  # per-run evidence ($BENCH_RUN_DIR)
+    result.json       # written by the command (optional)
+    metrics.jsonl     # streamed events (optional)
+    metrics.json      # normalized + validated by bench
+    artifacts/        # files the run produced
+    evaluator.stdout  # with --evaluate
+    evaluator.stderr
+    INCOMPLETE        # present only while a run is unfinished
 ```
 
 All string fields in `benchmark.json` are JSON-escaped, so commands
@@ -182,6 +194,70 @@ jq -r .command "$(bench --quiet 'echo "hello"')/benchmark.json"
   "environment": { "os": "Linux", "shell": "/bin/bash" }
 }
 ```
+
+## Custom measurements
+
+Any command can report its own metrics. bench creates a directory per run and
+exports it as `$BENCH_RUN_DIR`; write a result object there and bench
+validates, records and aggregates it.
+
+```bash
+cat > run-agent.sh <<'EOF'
+#!/bin/sh
+./agent --task "$TASK" > out.txt
+cat > "$BENCH_RESULT_JSON" <<JSON
+{"metrics": {"accuracy": 0.94, "tokens": 1842}, "artifacts": ["artifacts/patch.diff"]}
+JSON
+cp patch.diff "$BENCH_ARTIFACTS/"
+EOF
+
+bench --runs 20 ./run-agent.sh
+jq '.metrics.accuracy' bench-results/*/*/benchmark.json
+```
+
+Streaming collectors can append JSON Lines to `$BENCH_METRICS` instead:
+
+```json
+{"type":"metric","name":"tokens","value":1420,"unit":"token"}
+{"type":"artifact","path":"patch.diff"}
+```
+
+Metric values must be finite numbers; bad evidence marks the run
+`invalid_result` with an error naming the metric, rather than silently
+producing a misleading average. Raw per-run values are always kept — bench
+never trims outliers.
+
+## Independent evaluation
+
+A command reporting its own success proves nothing. `--evaluate` runs a
+separate command that receives the run directory and decides:
+
+```bash
+bench --runs 20 \
+  --evaluate ./grade-result.sh \
+  --require "tests_passed >= 40" \
+  --require-artifact "patch.diff" \
+  ./run-agent.sh
+```
+
+A run is **valid** only if the command met its exit requirement, its evidence
+validated, the evaluator succeeded, every `--require` held, and every required
+artifact exists. A subject declaring `"valid": true` is recorded and otherwise
+ignored; declaring `"valid": false` does veto the run.
+
+Each run reports why it is or is not valid:
+
+```bash
+jq -r '.runs[] | "\(.run_number): \(.status)"' bench-results/*/*/benchmark.json
+# 1: ok
+# 2: constraint_failed
+# 3: evaluator_failed
+```
+
+Statuses are `ok`, `command_failed`, `invalid_result`, `declared_invalid`,
+`evaluator_failed`, `constraint_failed` and `infrastructure_failed`. Note that
+`runs_successful` counts exit codes while `runs_valid` counts validated runs —
+they are deliberately different numbers.
 
 ## With other tools
 
@@ -220,7 +296,12 @@ bench --runs 20 \
 
 ## Future direction
 
-See [GENERAL-BENCHMARK-DESIGN.md](GENERAL-BENCHMARK-DESIGN.md) for the implementation proposal to extend Bench into a domain-agnostic, evidence-producing experiment runner while preserving the current simple CLI.
+See [GENERAL-BENCHMARK-DESIGN.md](GENERAL-BENCHMARK-DESIGN.md) for the plan to extend Bench into a domain-agnostic, evidence-producing experiment runner while preserving the current simple CLI.
+
+Phases 1 (stable evidence format) and 2 (evaluators and validity) are
+implemented — see [Custom measurements](#custom-measurements) and
+[Independent evaluation](#independent-evaluation). Phases 3–6 (manifests,
+variants, `bench compare`, provenance and resumption) are still proposals.
 
 ## Contributing
 

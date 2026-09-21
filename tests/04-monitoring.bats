@@ -328,7 +328,7 @@ load helpers
   kill_mock_process "$server_pid"
 }
 
-@test "schema version is 2.0 when using multi-process monitoring" {
+@test "schema version is reported when using multi-process monitoring" {
   cd "$TEST_TEMP_DIR"
 
   create_mock_process 60
@@ -337,7 +337,11 @@ load helpers
   [ "$status" -eq 0 ]
 
   json_file=$(find "$TEST_TEMP_DIR/bench-results" -name "benchmark.json" | head -1)
-  [ "$(jq -r '.schema_version' "$json_file")" = "2.0" ]
+  # Derived from the script so a schema bump does not require editing this
+  # test; the dedicated backward-compatibility tests cover what a bump may
+  # and may not change.
+  expected_schema=$(grep -m1 '^SCHEMA_VERSION=' "$BENCH_SCRIPT" | cut -d'"' -f2)
+  [ "$(jq -r '.schema_version' "$json_file")" = "$expected_schema" ]
 
   kill_mock_process "$MOCK_PID"
 }

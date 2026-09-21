@@ -45,6 +45,24 @@ Run commands with `bench`, compare results, and analyze performance.
 - `benchmark.json` - All metrics
 - `runs/*.log` - Per-run stdout+stderr
 - `runs/*.metrics` - Per-run process CPU/memory samples
+- `runs/<n>/` - Per-run evidence: `result.json`, `metrics.json`, `artifacts/`
+
+## Custom metrics and validation
+
+A command can report its own numbers by writing to `$BENCH_RESULT_JSON` (or
+streaming JSON Lines to `$BENCH_METRICS`) inside `$BENCH_RUN_DIR`:
+
+```json
+{"metrics": {"accuracy": 0.94, "tokens": 1842}, "artifacts": ["artifacts/patch.diff"]}
+```
+
+Aggregates land in `.metrics.<name>`, with every raw value under `.values`.
+
+`--evaluate CMD` validates each run independently; `--require "errors == 0"`
+and `--require-artifact PATH` add hard constraints. Report `runs_valid`, not
+just `success_rate`, whenever these are in use — a command exiting 0 is not the
+same as a run being valid, and a command claiming `"valid": true` is ignored by
+design.
 
 ## Examples
 
@@ -57,6 +75,9 @@ bench --name "api" --message "with cache" --runs 20 --port 8080 "curl -s localho
 
 # Quick comparison
 jq -r '"\(.message): \(.timing.mean)ms"' bench-results/api/*/benchmark.json
+
+# Why runs failed validation
+jq -r '.runs[] | select(.valid | not) | "\(.run_number): \(.status) - \(.error)"' bench-results/*/*/benchmark.json
 
 # Multi-process monitoring
 bench --name "stack" --pid "app:$(pgrep node)" --pid "redis:$(pgrep redis)" "curl -s localhost:3000"

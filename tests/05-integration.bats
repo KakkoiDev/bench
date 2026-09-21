@@ -16,7 +16,8 @@ load helpers
   [ -f "$json_file" ]
 
   # Verify all required fields present
-  grep -q '"schema_version": "2.0"' "$json_file"
+  expected_schema=$(grep -m1 '^SCHEMA_VERSION=' "$BENCH_SCRIPT" | cut -d'"' -f2)
+  grep -q "\"schema_version\": \"$expected_schema\"" "$json_file"
   grep -q '"name": "integration-test"' "$json_file"
   grep -q '"message": "full workflow"' "$json_file"
   grep -q '"runs_requested": 10' "$json_file"
