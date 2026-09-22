@@ -1,0 +1,27 @@
+schema_version: "1.0"
+name: agent-task
+message: an agent that reports success is not an agent that succeeded
+
+command: ./run.sh
+evaluate: ./grade.sh
+
+runs: 6
+timeout: 60s
+order: interleaved
+seed: 42
+
+variants:
+  honest:
+    env:
+      AGENT_MODE: "honest"
+  overconfident:
+    env:
+      AGENT_MODE: "overconfident"
+
+metrics:
+  tokens:
+    goal: minimize
+    unit: token
+  tests_failed:
+    goal: minimize
+    constraint: "== 0"

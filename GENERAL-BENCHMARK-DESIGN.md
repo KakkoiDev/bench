@@ -1,6 +1,6 @@
 # General Benchmark Design
 
-Status: phases 1, 2 and 5 implemented (schema 2.1); phases 3, 4 and 6 proposed
+Status: implemented (schema 2.1, manifest schema 1.0)
 
 ## Objective
 
@@ -348,27 +348,61 @@ Per-run status is one of `ok`, `command_failed`, `invalid_result`,
 `runs_successful`. A subject's own `"valid": true` is recorded and ignored; its
 `"valid": false` is honoured.
 
-### Phase 3 — Manifests and variants
+### Phase 3 — Manifests and variants — implemented
 
-- [ ] Define the minimal versioned manifest.
-- [ ] Add setup, command, evaluate, and cleanup lifecycle.
-- [ ] Add named variants.
-- [ ] Add warm-up and timeout behavior.
-- [ ] Add balanced or seeded randomized execution order.
-- [ ] Add `bench validate`.
+- [x] Define the minimal versioned manifest.
+- [x] Add setup, command, evaluate, and cleanup lifecycle.
+- [x] Add named variants.
+- [x] Add warm-up and timeout behavior.
+- [x] Add balanced or seeded randomized execution order.
+- [x] Add `bench validate`.
 
 Acceptance: one manifest can reproduce a baseline/candidate experiment with a recorded execution order.
 
-### Phase 4 — Comparison
+Manifest schema 1.0, in YAML or JSON. YAML::PP is not core Perl, so rather
+than take a CPAN dependency bench parses a documented restricted subset —
+comments, nested maps, sequences, quoted scalars — and refuses anything
+outside it rather than guessing. Unknown fields are errors, not warnings: a
+misspelled key that is silently dropped produces an experiment that is not the
+one that was written.
 
-- [ ] Add `bench compare`.
-- [ ] Calculate absolute and relative changes.
-- [ ] Add failure and invalid-run rates.
-- [ ] Add confidence intervals and paired comparisons.
-- [ ] Evaluate constraints.
-- [ ] Produce both human and JSON reports.
+Each variant produces a complete, standalone schema 2.1 result directory, so
+`compare`, `resume`, `report` and plain `jq` all work on it unchanged rather
+than needing to learn a second format. Lifecycle scope is explicit
+(`setup_scope`, `cleanup_scope`: experiment, variant or run) and warm-up runs
+never enter the recorded sample.
+
+Execution order defaults to `interleaved`, which rotates the variant order each
+round. Running every baseline observation and then every candidate one would
+attribute drift in machine state — temperature, page cache, background
+activity — to whichever variant ran second. `random` shuffles from the recorded
+seed; `sequential` exists for cases where switching between variants is itself
+expensive, and results from it carry that bias. The order actually executed and
+the seed are both written to `experiment.json`.
+
+### Phase 4 — Comparison — implemented
+
+- [x] Add `bench compare`.
+- [x] Calculate absolute and relative changes.
+- [x] Add failure and invalid-run rates.
+- [x] Add confidence intervals and paired comparisons.
+- [x] Evaluate constraints.
+- [x] Produce both human and JSON reports.
 
 Acceptance: Bench can state the size and uncertainty of a change while showing whether correctness constraints passed.
+
+Confidence intervals are bootstrap percentile intervals rather than
+t-intervals: benchmark samples are routinely skewed and multi-modal, and the
+bootstrap assumes no distribution. Resampling uses an explicit linear
+congruential generator seeded from the command line, so an interval is
+reproducible on any machine and any Perl build rather than depending on the
+platform's `rand()`.
+
+Comparison uses valid runs only — a run that failed its checks did not do the
+work being timed. The report states plainly that an interval excluding zero
+means a difference is *detectable in this sample*, and that whether it matters
+is a separate question the report does not answer. A violated `--require`
+exits non-zero so CI does not have to parse the report to find out.
 
 ### Phase 5 — Provenance and resumption — implemented
 
@@ -402,18 +436,39 @@ omitted variables is recorded. Bench's own results directory is excluded from
 the git dirty check, so a resume does not report dirty merely because the
 previous sitting wrote files.
 
-### Phase 6 — Domain demonstrations
+### Phase 6 — Domain demonstrations — implemented
 
 Implement examples without adding domain logic to Bench:
 
-- [ ] command/runtime performance;
-- [ ] web service performance plus correctness;
-- [ ] CI configuration comparison;
+- [x] command/runtime performance;
+- [x] web service performance plus correctness;
+- [x] CI configuration comparison;
 - [ ] local-model quality, latency, memory, and token measurements;
-- [ ] agent task execution with an independent test evaluator;
-- [ ] deterministic algorithm or optimizer comparison.
+- [x] agent task execution with an independent test evaluator;
+- [x] deterministic algorithm or optimizer comparison.
 
 Acceptance: each example uses the same Bench protocol and only small external adapters.
+
+Five of the six are in [`examples/`](examples/), each a subject, an evaluator
+and a manifest, using only the documented protocol. None required a change to
+bench, and a test asserts that every `BENCH_` variable they use is documented
+in `PROTOCOL.md`.
+
+The local-model example is deliberately not included: it needs model weights
+and hardware that cannot be assumed present, so it would be an example nobody
+could run. The agent-task example covers the same shape — a subject that
+reports its own token spend and claims success — without the dependency.
+
+Two of the five demonstrate the failure the protocol exists to catch, and both
+are asserted in the test suite: the overconfident agent writes `"valid": true`
+and exits zero yet scores zero valid runs, and the CI configuration that goes
+faster by skipping slow tests is measurably faster and entirely invalid.
+
+**This is demonstration, not evaluation.** All five adapters were written by
+the same author as the protocol, which measures that author's adapter-writing
+skill rather than the protocol's generality. Adapter effort is only a
+meaningful number once somebody else writes one, which is what `PROTOCOL.md`
+exists to make possible.
 
 ## Testing requirements
 

@@ -43,7 +43,7 @@
 
 set -e
 
-VERSION="2.4.0"
+VERSION="3.0.0"
 SCHEMA_VERSION="2.1"
 
 # Global state for signal handling
@@ -57,10 +57,29 @@ TIMES_FILE=""
 EXIT_CODES_FILE=""
 RUNS_FILE=""
 MEASUREMENTS_FILE=""
+# The four accumulators above are rebound per variant by select_variant, so
+# cleanup tracks the originally created paths separately rather than whichever
+# variant happened to be selected last.
+BASE_TEMP_FILES=""
 INGEST_PL=""
 AGGREGATE_PL=""
 PROVENANCE_PL=""
 RESUME_PL=""
+MANIFEST_PL=""
+COMPARE_PL=""
+SCHEDULE_FILE=""
+VARIANT_WORK=""
+VARIANT_NAMES=""
+CURRENT_VARIANT=""
+MULTI_VARIANT=0
+VARIANT_DONE_FILE=""
+VARIANT_ENV_FILE=""
+VARIANT_ERR_FILE=""
+MANIFEST_PATH=""
+MANIFEST_CONSTRAINTS=""
+MANIFEST_ARTIFACTS=""
+MANIFEST_VARIANTS=""
+MANIFEST_ENV_DIR=""
 REQUIRE_FILE=""
 
 # Release resources that would otherwise outlive the script.
@@ -75,14 +94,25 @@ cleanup() {
     kill "$SAMPLER_PID" 2>/dev/null || true
     SAMPLER_PID=""
   fi
-  [ -n "$TIMES_FILE" ] && rm -f "$TIMES_FILE"
-  [ -n "$EXIT_CODES_FILE" ] && rm -f "$EXIT_CODES_FILE"
-  [ -n "$RUNS_FILE" ] && rm -f "$RUNS_FILE"
-  [ -n "$MEASUREMENTS_FILE" ] && rm -f "$MEASUREMENTS_FILE"
+  if [ -n "$BASE_TEMP_FILES" ]; then
+    printf '%s\n' "$BASE_TEMP_FILES" | while IFS= read -r f; do
+      [ -n "$f" ] && rm -f "$f"
+    done
+    BASE_TEMP_FILES=""
+  fi
   [ -n "$INGEST_PL" ] && rm -f "$INGEST_PL"
   [ -n "$AGGREGATE_PL" ] && rm -f "$AGGREGATE_PL"
   [ -n "$PROVENANCE_PL" ] && rm -f "$PROVENANCE_PL"
   [ -n "$RESUME_PL" ] && rm -f "$RESUME_PL"
+  [ -n "$MANIFEST_PL" ] && rm -f "$MANIFEST_PL"
+  [ -n "$COMPARE_PL" ] && rm -f "$COMPARE_PL"
+  [ -n "$SCHEDULE_FILE" ] && rm -f "$SCHEDULE_FILE"
+  [ -n "$VARIANT_WORK" ] && rm -rf "$VARIANT_WORK"
+  [ -n "$VARIANT_ERR_FILE" ] && rm -f "$VARIANT_ERR_FILE"
+  [ -n "$MANIFEST_CONSTRAINTS" ] && rm -f "$MANIFEST_CONSTRAINTS"
+  [ -n "$MANIFEST_ARTIFACTS" ] && rm -f "$MANIFEST_ARTIFACTS"
+  [ -n "$MANIFEST_VARIANTS" ] && rm -f "$MANIFEST_VARIANTS"
+  [ -n "$MANIFEST_ENV_DIR" ] && rm -rf "$MANIFEST_ENV_DIR"
   [ -n "$REQUIRE_FILE" ] && rm -f "$REQUIRE_FILE"
   return 0
 }
@@ -104,8 +134,15 @@ show_version() {
 show_help() {
   cat << 'EOF'
 Usage: bench [OPTIONS] COMMAND
+       bench run MANIFEST [OPTIONS]
+       bench validate MANIFEST
+       bench compare BASELINE CANDIDATE [--json] [--seed N] [--require EXPR]
+       bench report DIR
 
 Minimal benchmarking CLI - Run commands multiple times and capture structured data.
+
+Subcommands must come first: `bench run exp.yaml --quiet`, not
+`bench --quiet run exp.yaml`.
 
 Options:
   --runs N            Number of runs (default: 10)
@@ -964,6 +1001,637 @@ exit 0;
 RESUME_EOF
 }
 
+# Write the manifest helper to a temp file
+#
+# Parses and validates an experiment manifest.
+#
+# Why a restricted YAML subset rather than a YAML library: YAML::PP is not
+# core Perl, and taking a CPAN dependency would cost the property that bench
+# runs wherever perl does. The manifest schema is deliberately small, so a
+# parser for exactly that shape is a few dozen lines and can reject anything
+# it does not understand instead of guessing. A .json manifest is accepted
+# too, parsed by JSON::PP, for anyone who would rather not rely on the subset.
+write_manifest_helper() {
+  MANIFEST_PL=$(mktemp)
+  cat > "$MANIFEST_PL" << 'MANIFEST_EOF'
+#!/usr/bin/perl
+# Parse and validate an experiment manifest.
+#
+# Usage: manifest.pl <manifest-path>
+#
+# On success prints a tab-separated line protocol and exits 0:
+#   FIELD    <key> <value>
+#   VARIANT  <name>
+#   VARENV   <variant> <key> <value>
+#   VARCMD   <variant> <command>
+#   METRIC   <name> <attribute> <value>
+#   JSON     <normalized manifest>
+#
+# On failure prints one diagnostic per line to stderr and exits 1.
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($path) = @ARGV;
+my @errors;
+sub fail { push @errors, $_[0]; }
+
+# -----------------------------------------------------------------------------
+# Restricted YAML subset
+#
+# Supported: comments, blank lines, "key: value", nested maps by indentation,
+# "- item" sequences, single/double quoted scalars, integers, floats, true,
+# false and null. Anything else -- anchors, aliases, flow collections, multi
+# line scalars, tabs for indentation -- is an error rather than a guess.
+# -----------------------------------------------------------------------------
+sub parse_scalar {
+  my ($raw, $line) = @_;
+  $raw =~ s/\s+$//;
+  return undef if !defined $raw || $raw eq '' || $raw eq '~' || lc($raw) eq 'null';
+  if ($raw =~ /^"(.*)"$/) { my $v = $1; $v =~ s/\\"/"/g; $v =~ s/\\\\/\\/g; return $v; }
+  if ($raw =~ /^'(.*)'$/) { my $v = $1; $v =~ s/''/'/g; return $v; }
+  return JSON::PP::true  if $raw eq 'true';
+  return JSON::PP::false if $raw eq 'false';
+  if ($raw =~ /^-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?$/) { return $raw + 0; }
+  if ($raw =~ /^[\[{]/) {
+    fail("line $line: flow collections are not supported; use an indented block");
+    return undef;
+  }
+  return $raw;
+}
+
+# Parse a block starting at $i with indentation greater than $parent_indent.
+# Returns (structure, next index).
+sub parse_block {
+  my ($lines, $i, $parent_indent) = @_;
+  my ($map, $seq);
+  my $indent;
+
+  while ($$i < scalar @$lines) {
+    my ($text, $lineno) = @{ $lines->[$$i] };
+    my ($sp) = $text =~ /^(\s*)/;
+    my $this_indent = length $sp;
+    last if $this_indent <= $parent_indent;
+
+    $indent = $this_indent unless defined $indent;
+    if ($this_indent != $indent) {
+      fail("line $lineno: inconsistent indentation");
+      $$i++;
+      next;
+    }
+
+    my $body = $text;
+    $body =~ s/^\s+//;
+
+    if ($body =~ /^-\s*(.*)$/) {
+      my $item = $1;
+      $seq = [] unless defined $seq;
+      push @$seq, parse_scalar($item, $lineno);
+      $$i++;
+      next;
+    }
+
+    if ($body =~ /^([A-Za-z_][A-Za-z0-9_.-]*)\s*:\s*(.*)$/) {
+      my ($key, $rest) = ($1, $2);
+      $map = {} unless defined $map;
+      $$i++;
+      if ($rest =~ /\S/) {
+        $map->{$key} = parse_scalar($rest, $lineno);
+      } else {
+        my $child = parse_block($lines, $i, $this_indent);
+        $map->{$key} = defined $child ? $child : {};
+      }
+      next;
+    }
+
+    fail("line $lineno: cannot parse '$body'");
+    $$i++;
+  }
+  return defined $seq ? $seq : $map;
+}
+
+sub parse_yaml_subset {
+  my ($text) = @_;
+  my @lines;
+  my $n = 0;
+  for my $raw (split /\n/, $text, -1) {
+    $n++;
+    my $line = $raw;
+    # Strip comments that are not inside a quoted scalar
+    if ($line =~ /^\s*#/) { next; }
+    $line =~ s/\s+#\s.*$// unless $line =~ /["']/;
+    next unless $line =~ /\S/;
+    if ($line =~ /^\t/ || $line =~ /^ *\t/) {
+      fail("line $n: tabs cannot be used for indentation");
+      next;
+    }
+    push @lines, [ $line, $n ];
+  }
+  my $i = 0;
+  my $doc = parse_block(\@lines, \$i, -1);
+  return $doc;
+}
+
+# -----------------------------------------------------------------------------
+# Load
+# -----------------------------------------------------------------------------
+if (!defined $path || !-f $path) {
+  print STDERR "manifest not found: " . (defined $path ? $path : '<none>') . "\n";
+  exit 1;
+}
+open my $fh, '<', $path or do { print STDERR "cannot read $path: $!\n"; exit 1; };
+my $text = do { local $/; <$fh> };
+close $fh;
+
+my $doc;
+if ($path =~ /\.json$/i) {
+  $doc = eval { JSON::PP->new->decode($text) };
+  if ($@) { my $e = $@; $e =~ s/\s+at\s+\S+\s+line\s+\d+\.?\s*$//s; print STDERR "invalid JSON: $e\n"; exit 1; }
+} else {
+  $doc = parse_yaml_subset($text);
+}
+
+if (!@errors && (!defined $doc || ref $doc ne 'HASH')) {
+  fail("manifest must be a mapping at the top level");
+}
+
+# -----------------------------------------------------------------------------
+# Validate
+#
+# Unknown fields are refused rather than ignored: a misspelled key that is
+# silently dropped produces an experiment that is not the one that was written.
+# -----------------------------------------------------------------------------
+my %known = map { $_ => 1 } qw(
+  schema_version name message command setup evaluate cleanup
+  runs warmup timeout expect_exit shell
+  setup_scope cleanup_scope
+  variants metrics require_artifacts capture_env order seed
+);
+
+my $MANIFEST_SCHEMA = '1.0';
+
+if (ref $doc eq 'HASH') {
+  for my $k (sort keys %$doc) {
+    fail("unknown field '$k'") unless $known{$k};
+  }
+
+  my $sv = $doc->{schema_version};
+  if (!defined $sv) {
+    fail("schema_version is required (expected \"$MANIFEST_SCHEMA\")");
+  } elsif ("$sv" ne $MANIFEST_SCHEMA) {
+    fail("unsupported schema_version '$sv' (this bench understands \"$MANIFEST_SCHEMA\")");
+  }
+
+  fail("command is required") unless defined $doc->{command} && !ref $doc->{command};
+
+  for my $k (qw(name message command setup evaluate cleanup timeout order)) {
+    next unless exists $doc->{$k};
+    fail("$k must be a string") if ref $doc->{$k};
+  }
+
+  for my $k (qw(runs warmup seed)) {
+    next unless exists $doc->{$k};
+    my $v = $doc->{$k};
+    fail("$k must be a whole number") unless defined $v && !ref $v && $v =~ /^\d+$/;
+  }
+  fail("runs must be at least 1") if defined $doc->{runs} && $doc->{runs} =~ /^\d+$/ && $doc->{runs} < 1;
+
+  if (defined $doc->{expect_exit} && !ref $doc->{expect_exit}) {
+    my $e = $doc->{expect_exit};
+    fail("expect_exit must be a number between 0 and 255, or \"any\"")
+      unless $e eq 'any' || ($e =~ /^\d+$/ && $e <= 255);
+  }
+
+  if (defined $doc->{timeout} && !ref $doc->{timeout}) {
+    fail("timeout must look like 30, 30s, 5m or 1h (got '$doc->{timeout}')")
+      unless $doc->{timeout} =~ /^\d+[smh]?$/;
+  }
+
+  for my $k (qw(setup_scope cleanup_scope)) {
+    next unless defined $doc->{$k};
+    fail("$k must be 'experiment', 'variant' or 'run' (got '$doc->{$k}')")
+      if ref $doc->{$k} || $doc->{$k} !~ /^(?:experiment|variant|run)$/;
+  }
+
+  if (defined $doc->{order} && !ref $doc->{order}) {
+    fail("order must be 'interleaved', 'random' or 'sequential' (got '$doc->{order}')")
+      unless $doc->{order} =~ /^(?:interleaved|random|sequential)$/;
+  }
+
+  if (exists $doc->{variants}) {
+    if (ref $doc->{variants} ne 'HASH' || !keys %{ $doc->{variants} }) {
+      fail("variants must be a mapping of at least one named variant");
+    } else {
+      for my $vn (sort keys %{ $doc->{variants} }) {
+        fail("variant name '$vn' must contain only letters, digits, '.', '_' or '-'")
+          unless $vn =~ /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+        my $v = $doc->{variants}{$vn};
+        $v = {} unless defined $v;
+        if (ref $v ne 'HASH') { fail("variant '$vn' must be a mapping"); next; }
+        for my $vk (sort keys %$v) {
+          fail("variant '$vn': unknown field '$vk'") unless $vk =~ /^(?:env|command|message)$/;
+        }
+        if (exists $v->{env}) {
+          if (ref $v->{env} ne 'HASH') { fail("variant '$vn': env must be a mapping"); }
+          else {
+            for my $ek (sort keys %{ $v->{env} }) {
+              fail("variant '$vn': environment name '$ek' is not valid")
+                unless $ek =~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+              fail("variant '$vn': env value for '$ek' must be a scalar")
+                if ref $v->{env}{$ek};
+            }
+          }
+        }
+      }
+    }
+  }
+
+  if (exists $doc->{metrics}) {
+    if (ref $doc->{metrics} ne 'HASH') {
+      fail("metrics must be a mapping of metric names");
+    } else {
+      for my $mn (sort keys %{ $doc->{metrics} }) {
+        fail("metric name '$mn' must match [A-Za-z_][A-Za-z0-9_.-]*")
+          unless $mn =~ /^[A-Za-z_][A-Za-z0-9_.-]*$/;
+        my $m = $doc->{metrics}{$mn};
+        $m = {} unless defined $m;
+        if (ref $m ne 'HASH') { fail("metric '$mn' must be a mapping"); next; }
+        for my $mk (sort keys %$m) {
+          fail("metric '$mn': unknown field '$mk'") unless $mk =~ /^(?:goal|constraint|unit)$/;
+        }
+        if (defined $m->{goal} && $m->{goal} !~ /^(?:minimize|maximize)$/) {
+          fail("metric '$mn': goal must be 'minimize' or 'maximize' (got '$m->{goal}')");
+        }
+        if (defined $m->{constraint}) {
+          my $c = $m->{constraint};
+          fail("metric '$mn': constraint must look like '<= 100' or '== 0' (got '$c')")
+            unless !ref $c && $c =~ /^\s*(?:==|!=|<=|>=|<|>)\s*-?(?:\d+\.?\d*|\.\d+)(?:[eE][-+]?\d+)?\s*$/;
+        }
+      }
+    }
+  }
+
+  if (exists $doc->{require_artifacts}) {
+    if (ref $doc->{require_artifacts} ne 'ARRAY') {
+      fail("require_artifacts must be a list");
+    } else {
+      for my $a (@{ $doc->{require_artifacts} }) {
+        fail("require_artifacts entries must be relative paths (got '$a')")
+          if !defined $a || ref $a || $a =~ m{^/} || $a =~ m{(?:^|/)\.\.(?:/|$)};
+      }
+    }
+  }
+
+  if (exists $doc->{capture_env}) {
+    if (ref $doc->{capture_env} ne 'ARRAY') {
+      fail("capture_env must be a list of variable names");
+    } else {
+      for my $e (@{ $doc->{capture_env} }) {
+        fail("capture_env entries must be environment variable names (got '$e')")
+          unless defined $e && !ref $e && $e =~ /^[A-Za-z_][A-Za-z0-9_]*$/;
+      }
+    }
+  }
+}
+
+if (@errors) {
+  print STDERR "$_\n" for @errors;
+  exit 1;
+}
+
+# -----------------------------------------------------------------------------
+# Emit
+# -----------------------------------------------------------------------------
+sub scalar_out {
+  my ($v) = @_;
+  return '' unless defined $v;
+  return $v ? 'true' : 'false' if JSON::PP::is_bool($v);
+  return "$v";
+}
+
+for my $k (qw(schema_version name message command setup evaluate cleanup
+              setup_scope cleanup_scope
+              runs warmup timeout expect_exit order seed)) {
+  next unless defined $doc->{$k};
+  printf "FIELD\t%s\t%s\n", $k, scalar_out($doc->{$k});
+}
+
+if (ref $doc->{variants} eq 'HASH') {
+  for my $vn (sort keys %{ $doc->{variants} }) {
+    printf "VARIANT\t%s\n", $vn;
+    my $v = $doc->{variants}{$vn} || {};
+    printf "VARCMD\t%s\t%s\n", $vn, scalar_out($v->{command}) if defined $v->{command};
+    if (ref $v->{env} eq 'HASH') {
+      for my $ek (sort keys %{ $v->{env} }) {
+        printf "VARENV\t%s\t%s\t%s\n", $vn, $ek, scalar_out($v->{env}{$ek});
+      }
+    }
+  }
+}
+
+if (ref $doc->{metrics} eq 'HASH') {
+  for my $mn (sort keys %{ $doc->{metrics} }) {
+    my $m = $doc->{metrics}{$mn} || {};
+    for my $attr (qw(goal constraint unit)) {
+      printf "METRIC\t%s\t%s\t%s\n", $mn, $attr, scalar_out($m->{$attr})
+        if defined $m->{$attr};
+    }
+  }
+}
+
+if (ref $doc->{require_artifacts} eq 'ARRAY') {
+  printf "ARTIFACT\t%s\n", scalar_out($_) for @{ $doc->{require_artifacts} };
+}
+if (ref $doc->{capture_env} eq 'ARRAY') {
+  printf "CAPTUREENV\t%s\n", scalar_out($_) for @{ $doc->{capture_env} };
+}
+
+print "JSON\t", JSON::PP->new->canonical->encode($doc), "\n";
+exit 0;
+MANIFEST_EOF
+}
+
+# Write the comparison helper to a temp file
+#
+# Compares two completed executions and reports the size of the difference
+# together with its uncertainty.
+write_compare_helper() {
+  COMPARE_PL=$(mktemp)
+  cat > "$COMPARE_PL" << 'COMPARE_EOF'
+#!/usr/bin/perl
+# Compare two benchmark results.
+#
+# Usage: compare.pl <baseline.json> <candidate.json> <seed> <constraints-file>
+#
+# Prints the comparison as JSON on stdout. The caller renders it for humans or
+# passes it through verbatim.
+#
+# Confidence intervals are bootstrap percentile intervals rather than
+# t-intervals. Benchmark samples are routinely skewed and multi-modal --
+# Georges et al. and Mytkowicz et al. are the standard references for why --
+# and the bootstrap makes no normality assumption. The resampling uses an
+# explicit linear congruential generator seeded from the command line, so the
+# interval is reproducible on any machine and any Perl build rather than
+# depending on the platform's rand().
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($base_path, $cand_path, $seed, $constraint_path) = @ARGV;
+$seed = 42 unless defined $seed && $seed =~ /^\d+$/;
+
+sub load {
+  my ($path) = @_;
+  open my $fh, '<', $path or die "cannot read $path: $!\n";
+  my $txt = do { local $/; <$fh> };
+  close $fh;
+  my $d = eval { JSON::PP->new->decode($txt) };
+  die "$path is not valid JSON\n" if $@ || ref $d ne 'HASH';
+  return $d;
+}
+
+my $base = load($base_path);
+my $cand = load($cand_path);
+
+# ---- deterministic PRNG ------------------------------------------------------
+# Numerical Recipes LCG; adequate for resampling and identical everywhere.
+my $rng_state = $seed % 2147483647;
+$rng_state = 1 if $rng_state == 0;
+sub next_rand {
+  $rng_state = ($rng_state * 1103515245 + 12345) % 2147483648;
+  return $rng_state / 2147483648;
+}
+
+# ---- statistics --------------------------------------------------------------
+sub mean { my $s = 0; $s += $_ for @{ $_[0] }; return @{ $_[0] } ? $s / scalar @{ $_[0] } : 0; }
+
+sub percentile {
+  my ($vals, $p) = @_;
+  my @s = sort { $a <=> $b } @$vals;
+  return 0 unless @s;
+  my $rank = int($p * scalar(@s) / 100);
+  $rank = $#s if $rank > $#s;
+  return $s[$rank];
+}
+
+sub median_of {
+  my @s = sort { $a <=> $b } @{ $_[0] };
+  my $n = scalar @s;
+  return 0 unless $n;
+  return $n % 2 ? $s[($n - 1) / 2] : ($s[$n / 2 - 1] + $s[$n / 2]) / 2;
+}
+
+sub stddev {
+  my ($v) = @_;
+  my $n = scalar @$v;
+  return 0 if $n < 2;
+  my $m = mean($v);
+  my $ss = 0;
+  $ss += ($_ - $m) ** 2 for @$v;
+  return sqrt($ss / ($n - 1));
+}
+
+sub num { return 0 + sprintf('%.6f', $_[0]); }
+
+# Bootstrap percentile interval for the difference in means.
+#
+# The sample parameters are deliberately not named $a and $b: those are Perl's
+# sort variables, and a lexical of the same name silently breaks every sort in
+# the same scope -- which reverses the interval bounds rather than failing.
+sub bootstrap_diff_ci {
+  my ($xs, $ys, $iters) = @_;
+  return (undef, undef) unless @$xs && @$ys;
+  my @diffs;
+  for (1 .. $iters) {
+    my ($sx, $sy) = (0, 0);
+    $sx += $xs->[int(next_rand() * scalar @$xs)] for 1 .. scalar @$xs;
+    $sy += $ys->[int(next_rand() * scalar @$ys)] for 1 .. scalar @$ys;
+    push @diffs, ($sy / scalar @$ys) - ($sx / scalar @$xs);
+  }
+  my @sorted = sort { $a <=> $b } @diffs;
+  my $lo = $sorted[ int(0.025 * scalar @sorted) ];
+  my $hi = $sorted[ int(0.975 * scalar @sorted) ];
+  $hi = $sorted[-1] unless defined $hi;
+  return ($lo, $hi);
+}
+
+sub summarize {
+  my ($v) = @_;
+  my @sorted = sort { $a <=> $b } @$v;
+  return {
+    count  => scalar @$v,
+    mean   => num(mean($v)),
+    median => num(median_of($v)),
+    min    => num(@sorted ? $sorted[0]  : 0),
+    max    => num(@sorted ? $sorted[-1] : 0),
+    stddev => num(stddev($v)),
+    p95    => num(percentile($v, 95)),
+    p99    => num(percentile($v, 99)),
+  };
+}
+
+# ---- gather samples ----------------------------------------------------------
+# Timing comes from valid runs only: a run that failed its checks did not do
+# the work being timed, so including it compares different things.
+sub timing_sample {
+  my ($d) = @_;
+  my @v;
+  for my $r (@{ $d->{runs} || [] }) {
+    next unless ref $r eq 'HASH';
+    next unless $r->{valid};
+    push @v, $r->{duration_ms} + 0 if defined $r->{duration_ms};
+  }
+  return \@v;
+}
+
+sub metric_sample {
+  my ($d, $name) = @_;
+  my $m = $d->{metrics};
+  return [] unless ref $m eq 'HASH' && ref $m->{$name} eq 'HASH';
+  my $vals = $m->{$name}{values};
+  my $runs = $m->{$name}{runs};
+  return [] unless ref $vals eq 'ARRAY';
+  # Restrict to observations from valid runs, matching the timing rule
+  my %valid = map { $_->{run_number} => 1 }
+              grep { ref $_ eq 'HASH' && $_->{valid} } @{ $d->{runs} || [] };
+  my @out;
+  for my $i (0 .. $#$vals) {
+    my $rn = (ref $runs eq 'ARRAY' && defined $runs->[$i]) ? $runs->[$i] : undef;
+    next if defined $rn && !$valid{$rn};
+    push @out, $vals->[$i] + 0;
+  }
+  return \@out;
+}
+
+sub compare_series {
+  my ($xs, $ys, $paired_ok) = @_;
+  my $out = {
+    baseline  => summarize($xs),
+    candidate => summarize($ys),
+  };
+  return $out unless @$xs && @$ys;
+
+  my $ma = mean($xs);
+  my $mb = mean($ys);
+  $out->{absolute_difference} = num($mb - $ma);
+  $out->{relative_difference_percent} =
+    $ma == 0 ? undef : num(100 * ($mb - $ma) / $ma);
+
+  my ($lo, $hi) = bootstrap_diff_ci($xs, $ys, 2000);
+  if (defined $lo) {
+    $out->{difference_ci_95} = [ num($lo), num($hi) ];
+    # "Detectable" only says the interval excludes zero. Whether a difference
+    # of this size matters is a question about the system, not the sample.
+    $out->{interval_excludes_zero} =
+      (($lo > 0 && $hi > 0) || ($lo < 0 && $hi < 0)) ? JSON::PP::true : JSON::PP::false;
+  }
+
+  if ($paired_ok && scalar(@$xs) == scalar(@$ys) && @$xs > 1) {
+    my @d = map { $ys->[$_] - $xs->[$_] } 0 .. $#$xs;
+    my ($plo, $phi) = bootstrap_diff_ci([ map { 0 } @d ], \@d, 2000);
+    $out->{paired} = {
+      mean_difference => num(mean(\@d)),
+      ci_95           => defined $plo ? [ num($plo), num($phi) ] : undef,
+    };
+  }
+  return $out;
+}
+
+# ---- validity ----------------------------------------------------------------
+sub validity_of {
+  my ($d) = @_;
+  my $completed = $d->{runs_completed} || 0;
+  my $valid     = defined $d->{runs_valid} ? $d->{runs_valid} : $completed;
+  return {
+    runs_completed => $completed + 0,
+    runs_valid     => $valid + 0,
+    runs_invalid   => $completed - $valid,
+    invalid_rate_percent => $completed ? num(100 * ($completed - $valid) / $completed) : 0,
+    validity       => ($d->{validity} || {}),
+  };
+}
+
+# ---- constraints -------------------------------------------------------------
+my @constraints;
+if (defined $constraint_path && -f $constraint_path && open my $cf, '<', $constraint_path) {
+  while (my $l = <$cf>) { chomp $l; push @constraints, $l if $l =~ /\S/; }
+  close $cf;
+}
+
+sub metric_names {
+  my ($d) = @_;
+  return () unless ref $d->{metrics} eq 'HASH';
+  return keys %{ $d->{metrics} };
+}
+
+my %seen;
+my @shared = grep { !$seen{$_}++ }
+             grep { my $n = $_; grep { $_ eq $n } metric_names($cand) } metric_names($base);
+
+my %metrics_out;
+for my $name (sort @shared) {
+  my $a = metric_sample($base, $name);
+  my $b = metric_sample($cand, $name);
+  next unless @$a || @$b;
+  $metrics_out{$name} = compare_series($a, $b, 1);
+}
+
+# Evaluate constraints against the candidate's valid-run means
+my @constraint_results;
+for my $c (@constraints) {
+  my ($name, $op, $want) = split /\s+/, $c, 3;
+  my $entry = { expression => $c };
+  my $sample = $name eq 'duration_ms' ? timing_sample($cand) : metric_sample($cand, $name);
+  if (!@$sample) {
+    $entry->{status} = 'unknown';
+    $entry->{reason} = "the candidate reported no valid observations of '$name'";
+  } else {
+    my $have = mean($sample);
+    my $ok = $op eq '==' ? $have == $want
+           : $op eq '!=' ? $have != $want
+           : $op eq '<'  ? $have <  $want
+           : $op eq '<=' ? $have <= $want
+           : $op eq '>'  ? $have >  $want
+           : $op eq '>=' ? $have >= $want
+           : undef;
+    $entry->{observed} = num($have);
+    $entry->{status} = defined $ok ? ($ok ? 'passed' : 'failed') : 'unknown';
+  }
+  push @constraint_results, $entry;
+}
+
+my $report = {
+  schema_version => '1.0',
+  seed           => $seed + 0,
+  bootstrap_iterations => 2000,
+  baseline  => {
+    path    => $base_path,
+    name    => $base->{name},
+    message => $base->{message},
+    command => $base->{command},
+    %{ validity_of($base) },
+  },
+  candidate => {
+    path    => $cand_path,
+    name    => $cand->{name},
+    message => $cand->{message},
+    command => $cand->{command},
+    %{ validity_of($cand) },
+  },
+  timing  => compare_series(timing_sample($base), timing_sample($cand), 1),
+  metrics => \%metrics_out,
+  constraints => \@constraint_results,
+  note => 'Confidence intervals are bootstrap percentile intervals over valid '
+        . 'runs. An interval that excludes zero means the difference is '
+        . 'detectable in this sample; whether it matters is a separate '
+        . 'question this report does not answer.',
+};
+
+print JSON::PP->new->canonical->pretty->encode($report);
+exit 0;
+COMPARE_EOF
+}
+
 # Generate auto-name from command
 # Algorithm: Remove quotes/special chars → lowercase → spaces to dashes → remove consecutive dashes → truncate 50 → trim trailing dashes
 # Falls back to "benchmark" if result is empty (e.g., command is all special chars)
@@ -1149,6 +1817,493 @@ stop_metrics_sampler() {
   sample_processes "$run_num" "$(date +%Y-%m-%dT%H:%M:%S)"
 }
 
+# Run a lifecycle hook
+#
+# Scope is explicit rather than inferred: "experiment" runs once around the
+# whole execution, "variant" once around each variant's observations, "run"
+# before every single run. A hook that fails stops the experiment, because
+# continuing would measure a system that was not prepared.
+#
+# Args: $1 = command, $2 = configured scope, $3 = scope being entered,
+#       $4 = label for diagnostics
+run_hook() {
+  [ -n "$1" ] || return 0
+  [ "$2" = "$3" ] || return 0
+  _rh_env=""
+  if [ -n "$VARIANT_ENV_FILE" ] && [ -s "$VARIANT_ENV_FILE" ]; then
+    _rh_env="$(cat "$VARIANT_ENV_FILE") "
+  fi
+  if ! sh -c "${_rh_env}$1" >/dev/null 2>&1; then
+    error "$4 command failed: $1"
+  fi
+  return 0
+}
+
+# Single-quote a string for safe re-embedding in a shell command
+quote_for_sh() {
+  printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+# Record how an experiment with variants was scheduled
+#
+# Written at the execution root alongside the per-variant results, so the
+# ordering and seed that produced them are part of the evidence rather than
+# something the reader has to take on trust.
+write_experiment_json() {
+  _we_root="$1"
+  _we_variants=$(printf '%s' "$VARIANT_NAMES" | grep . | perl -ne 'chomp; push @v, $_; END { print join(",", map { "\"$_\"" } @v) }')
+  _we_order=$(perl -ne 'chomp; next unless /\S/; my ($v, $r) = split / /; print "{\"variant\":\"$v\",\"run\":$r},";' "$SCHEDULE_FILE" | sed 's/,$//')
+  cat > "$_we_root/experiment.json" << EXPJSON
+{
+  "schema_version": "$SCHEMA_VERSION",
+  "tool": "bench",
+  "tool_version": "$VERSION",
+  "name": "$(json_escape "$NAME")",
+  "message": "$(json_escape "$MESSAGE")",
+  "manifest": "$(json_escape "$MANIFEST_PATH")",
+  "runs_per_variant": $RUNS,
+  "warmup": $WARMUP,
+  "order": "$ORDER",
+  "seed": $SEED,
+  "variants": [$_we_variants],
+  "execution_order": [$_we_order],
+  "provenance": $provenance_full
+}
+EXPJSON
+}
+
+# Build the execution schedule across variants
+#
+# Why not run every baseline observation and then every candidate one:
+# machine state drifts. Temperature, page cache, background activity and time
+# of day all move during a long benchmark, and a block design attributes that
+# drift to whichever variant ran second. Interleaving spreads it across both.
+#
+# "interleaved" rotates the variant order each round, so no variant is always
+# measured on a cold or warm machine. "random" shuffles each round from the
+# recorded seed. "sequential" runs each variant to completion and exists only
+# for cases where switching between variants is itself expensive -- it is not
+# the default, and results from it carry that bias.
+#
+# Args: $1 = runs per variant, $2 = order, $3 = seed
+build_schedule() {
+  _bs_runs="$1"
+  _bs_order="$2"
+  _bs_seed="$3"
+  printf '%s' "$VARIANT_NAMES" | grep . | perl -e '
+    my ($runs, $order, $seed) = @ARGV;
+    my @variants = map { chomp; $_ } <STDIN>;
+    # Same generator as the comparison bootstrap: reproducible everywhere,
+    # independent of the platform rand().
+    my $state = ($seed % 2147483647) || 1;
+    my $rnd = sub {
+      $state = ($state * 1103515245 + 12345) % 2147483648;
+      return $state / 2147483648;
+    };
+    if ($order eq "sequential") {
+      for my $v (@variants) { print "$v $_\n" for 1 .. $runs; }
+      exit 0;
+    }
+    for my $round (1 .. $runs) {
+      my @order = @variants;
+      if ($order eq "random") {
+        for (my $i = $#order; $i > 0; $i--) {
+          my $j = int($rnd->() * ($i + 1));
+          @order[$i, $j] = @order[$j, $i];
+        }
+      } elsif ($order eq "interleaved") {
+        my $shift = ($round - 1) % scalar(@order);
+        @order = (@order[$shift .. $#order], @order[0 .. $shift - 1]) if $shift;
+      }
+      print "$_ $round
+" for @order;
+    }
+  ' "$_bs_runs" "$_bs_order" "$_bs_seed"
+}
+
+# Point the per-run machinery at one variant's context
+#
+# The run body reads COMMAND, OUTPUT_DIR and the four accumulator files from
+# these variables, so switching variants is a matter of rebinding them. For a
+# plain `bench "command"` there is one variant and this is a no-op after the
+# first call.
+select_variant() {
+  _sv_name="$1"
+  [ "$CURRENT_VARIANT" = "$_sv_name" ] && return 0
+  CURRENT_VARIANT="$_sv_name"
+
+  _sv_dir="$VARIANT_WORK/$_sv_name"
+  OUTPUT_DIR=$(cat "$_sv_dir/outdir")
+  COMMAND=$(cat "$_sv_dir/command")
+  RUNS_FILE="$_sv_dir/runs"
+  TIMES_FILE="$_sv_dir/times"
+  EXIT_CODES_FILE="$_sv_dir/exits"
+  MEASUREMENTS_FILE="$_sv_dir/measurements"
+  VARIANT_DONE_FILE="$_sv_dir/done"
+
+  # A variant's environment is applied to the command rather than exported
+  # into bench itself, so one variant cannot leak settings into the next.
+  VARIANT_ENV_FILE="$_sv_dir/env"
+  return 0
+}
+
+# Register a variant and its per-variant state
+register_variant() {
+  _rv_name="$1"
+  _rv_command="$2"
+  _rv_outdir="$3"
+  _rv_dir="$VARIANT_WORK/$_rv_name"
+  mkdir -p "$_rv_dir" "$_rv_outdir/runs"
+  printf '%s' "$_rv_outdir"  > "$_rv_dir/outdir"
+  printf '%s' "$_rv_command" > "$_rv_dir/command"
+  : > "$_rv_dir/runs"
+  : > "$_rv_dir/times"
+  : > "$_rv_dir/exits"
+  : > "$_rv_dir/measurements"
+  : > "$_rv_dir/done"
+  : > "$_rv_dir/env"
+  mkdir -p "$_rv_dir/warmup"
+  VARIANT_NAMES="$VARIANT_NAMES$_rv_name
+"
+}
+
+# Count per-status outcomes for one variant from its recorded runs
+#
+# Derived rather than tallied during the loop: with several variants in flight
+# a set of counters per variant would have to be kept in shell variables, and
+# the runs file already holds the answer.
+derive_tallies() {
+  perl -MJSON::PP -e '
+    my %n = (ok => 0, command_failed => 0, invalid_result => 0,
+             declared_invalid => 0, evaluator_failed => 0,
+             constraint_failed => 0, infrastructure_failed => 0);
+    my ($completed, $valid) = (0, 0);
+    while (my $line = <STDIN>) {
+      next unless $line =~ /\S/;
+      my $r = eval { JSON::PP->new->decode($line) };
+      next unless ref $r eq "HASH";
+      $completed++;
+      my $st = defined $r->{status} ? $r->{status} : "ok";
+      $n{$st}++ if exists $n{$st};
+      $valid++ if $r->{valid};
+    }
+    print "RUNS_COMPLETED=$completed
+";
+    print "runs_valid=$valid
+";
+    print "status_$_=$n{$_}
+" for sort keys %n;
+  ' < "$1"
+}
+
+# Subcommand: run an experiment from a manifest
+#
+# Reads the manifest into the same settings the flag interface uses, so a
+# manifest run and a command-line run go through one code path. Flags given
+# after the manifest still win, which makes --resume and --quiet usable
+# without editing the file.
+load_manifest() {
+  MANIFEST_PATH="$1"
+  [ -n "$MANIFEST_PATH" ] || error "run requires a manifest path"
+  shift 2>/dev/null || true
+
+  VARIANT_ERR_FILE=$(mktemp)
+  MANIFEST_CONSTRAINTS=$(mktemp)
+  MANIFEST_ARTIFACTS=$(mktemp)
+  MANIFEST_VARIANTS=$(mktemp)
+
+  check_dependencies
+  write_manifest_helper
+  if ! manifest_out=$(perl "$MANIFEST_PL" "$MANIFEST_PATH" 2>"$VARIANT_ERR_FILE"); then
+    sed 's/^/  /' "$VARIANT_ERR_FILE" >&2
+    rm -f "$VARIANT_ERR_FILE"
+    error "$MANIFEST_PATH is not a valid experiment manifest"
+  fi
+  rm -f "$VARIANT_ERR_FILE"
+
+  _lm_field() { printf '%s\n' "$manifest_out" | sed -n "s/^FIELD	$1	//p"; }
+
+  COMMAND=$(_lm_field command)
+  _lm_name=$(_lm_field name);        [ -n "$_lm_name" ] && NAME="$_lm_name"
+  _lm_msg=$(_lm_field message);      [ -n "$_lm_msg" ] && MESSAGE="$_lm_msg"
+  SETUP_CMD=$(_lm_field setup)
+  EVALUATE_CMD=$(_lm_field evaluate)
+  CLEANUP_CMD=$(_lm_field cleanup)
+  _lm_ss=$(_lm_field setup_scope);   [ -n "$_lm_ss" ] && SETUP_SCOPE="$_lm_ss"
+  _lm_cs=$(_lm_field cleanup_scope); [ -n "$_lm_cs" ] && CLEANUP_SCOPE="$_lm_cs"
+  _lm_runs=$(_lm_field runs);        [ -n "$_lm_runs" ] && RUNS="$_lm_runs"
+  _lm_warm=$(_lm_field warmup);      [ -n "$_lm_warm" ] && WARMUP="$_lm_warm"
+  _lm_to=$(_lm_field timeout);       [ -n "$_lm_to" ] && TIMEOUT="$_lm_to"
+  _lm_ee=$(_lm_field expect_exit);   [ -n "$_lm_ee" ] && EXPECT_EXIT="$_lm_ee"
+  _lm_order=$(_lm_field order);      [ -n "$_lm_order" ] && ORDER="$_lm_order"
+  _lm_seed=$(_lm_field seed);        [ -n "$_lm_seed" ] && SEED="$_lm_seed"
+
+  # Constraints declared per metric become the same hard constraints the
+  # --require flag produces, so validity means one thing however it was asked for.
+  printf '%s\n' "$manifest_out" | sed -n 's/^METRIC	\([^	]*\)	constraint	\(.*\)$/\1 \2/p' \
+  | while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      printf '%s\n' "$c"
+    done > "$MANIFEST_CONSTRAINTS"
+  if [ -s "$MANIFEST_CONSTRAINTS" ]; then
+    [ -n "$REQUIRE_FILE" ] || REQUIRE_FILE=$(mktemp)
+    while IFS= read -r c; do
+      [ -n "$c" ] || continue
+      validate_constraint "$c"
+      printf '%s\n' "$c" >> "$REQUIRE_FILE"
+    done < "$MANIFEST_CONSTRAINTS"
+  fi
+
+  printf '%s\n' "$manifest_out" | sed -n 's/^ARTIFACT	//p' | while IFS= read -r a; do
+    [ -n "$a" ] && printf '%s\n' "$a"
+  done > "$MANIFEST_ARTIFACTS"
+  while IFS= read -r a; do
+    [ -n "$a" ] || continue
+    REQUIRE_ARTIFACTS="$REQUIRE_ARTIFACTS$a
+"
+  done < "$MANIFEST_ARTIFACTS"
+
+  while IFS= read -r e; do
+    [ -n "$e" ] || continue
+    CAPTURE_ENV="$CAPTURE_ENV
+$e"
+  done <<CAPTURE_EOF
+$(printf '%s\n' "$manifest_out" | sed -n 's/^CAPTUREENV	//p')
+CAPTURE_EOF
+
+  # Variants: one line of "<name><tab><command>", plus an env file each
+  VARIANT_ENV_SRC=$(mktemp -d)
+  MANIFEST_ENV_DIR="$VARIANT_ENV_SRC"
+  _lm_variants=$(printf '%s\n' "$manifest_out" | sed -n 's/^VARIANT	//p')
+  if [ -n "$_lm_variants" ]; then
+    VARIANT_SPEC=""
+    printf '%s\n' "$_lm_variants" | grep . | while IFS= read -r v; do
+      [ -n "$v" ] || continue
+      vc=$(printf '%s\n' "$manifest_out" | sed -n "s/^VARCMD	$v	//p")
+      printf '%s\t%s\n' "$v" "$vc"
+      printf '%s\n' "$manifest_out" \
+        | sed -n "s/^VARENV	$v	\([^	]*\)	\(.*\)$/\1=\2/p" \
+        | while IFS= read -r kv; do
+            k="${kv%%=*}"
+            val="${kv#*=}"
+            printf '%s=%s ' "$k" "$(quote_for_sh "$val")"
+          done > "$VARIANT_ENV_SRC/$v"
+    done > "$MANIFEST_VARIANTS"
+    VARIANT_SPEC=$(cat "$MANIFEST_VARIANTS")
+  fi
+
+  # Remaining arguments are ordinary flags and override the manifest
+  MANIFEST_EXTRA_ARGS="$*"
+  return 0
+}
+
+# Subcommand: validate a manifest
+#
+# Exits 0 and says so when the manifest is usable; otherwise prints every
+# problem found, not just the first, so one pass fixes the file.
+cmd_validate() {
+  manifest="$1"
+  if [ -z "$manifest" ]; then
+    error "validate requires a manifest path"
+  fi
+  check_dependencies
+  write_manifest_helper
+  if manifest_out=$(perl "$MANIFEST_PL" "$manifest" 2>&1 >/dev/null); then
+    :
+  else
+    printf '%s\n' "$manifest_out" | sed 's/^/  /' >&2
+    error "$manifest is not a valid experiment manifest"
+  fi
+  variants=$(perl "$MANIFEST_PL" "$manifest" | sed -n 's/^VARIANT\t//p' | tr '\n' ' ')
+  echo "$manifest is valid"
+  [ -n "$variants" ] && echo "  variants: $variants"
+  exit 0
+}
+
+# Subcommand: compare two completed executions
+cmd_compare() {
+  baseline="$1"
+  candidate="$2"
+  # Checked before shifting: shift is a special builtin, and shifting past the
+  # end aborts a non-interactive shell before the diagnostic can be printed.
+  if [ -z "$baseline" ] || [ -z "$candidate" ]; then
+    error "compare requires two result directories"
+  fi
+  shift 2
+  for d in "$baseline" "$candidate"; do
+    [ -f "$d/benchmark.json" ] || error "no benchmark.json in $d"
+  done
+
+  compare_json=0
+  compare_seed=42
+  compare_constraints=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --json) compare_json=1; shift ;;
+      --seed)
+        shift
+        case "$1" in
+          ''|*[!0-9]*) error "--seed requires a whole number" ;;
+        esac
+        compare_seed="$1"; shift ;;
+      --require)
+        shift
+        [ -n "$1" ] || error "--require requires an expression"
+        validate_constraint "$1"
+        [ -n "$compare_constraints" ] || compare_constraints=$(mktemp)
+        printf '%s\n' "$1" >> "$compare_constraints"
+        shift ;;
+      *) error "Unknown option for compare: $1" ;;
+    esac
+  done
+
+  check_dependencies
+  write_compare_helper
+  report=$(perl "$COMPARE_PL" "$baseline/benchmark.json" "$candidate/benchmark.json" \
+                "$compare_seed" "$compare_constraints") \
+    || error "could not compare those results"
+  [ -n "$compare_constraints" ] && rm -f "$compare_constraints"
+
+  if [ "$compare_json" -eq 1 ]; then
+    printf '%s\n' "$report"
+    exit 0
+  fi
+
+  render_comparison "$report"
+  # A failed constraint is a failed comparison: exit non-zero so a script or
+  # CI job does not have to parse the report to find that out.
+  if printf '%s' "$report" | grep -q '"status" : "failed"'; then
+    exit 1
+  fi
+  exit 0
+}
+
+# Render a comparison report for a human reader
+render_comparison() {
+  printf '%s' "$1" | perl -MJSON::PP -e '
+    my $txt = do { local $/; <STDIN> };
+    my $r = JSON::PP->new->decode($txt);
+    my $fmt = sub {
+      my ($s) = @_;
+      return sprintf("%10s %10s %10s", "-", "-", "-") unless $s && $s->{count};
+      return sprintf("%10.3f %10.3f %10.3f", $s->{mean}, $s->{median}, $s->{p95});
+    };
+    printf "%s  ->  %s
+
+",
+      (defined $r->{baseline}{message} && length $r->{baseline}{message}
+        ? $r->{baseline}{message} : "baseline"),
+      (defined $r->{candidate}{message} && length $r->{candidate}{message}
+        ? $r->{candidate}{message} : "candidate");
+
+    for my $side (qw(baseline candidate)) {
+      printf "  %-10s %d/%d runs valid (%.1f%% invalid)
+", $side,
+        $r->{$side}{runs_valid}, $r->{$side}{runs_completed},
+        $r->{$side}{invalid_rate_percent};
+    }
+    print "
+";
+
+    my @rows = (["duration_ms", $r->{timing}]);
+    push @rows, [$_, $r->{metrics}{$_}] for sort keys %{ $r->{metrics} || {} };
+
+    printf "  %-22s %10s %10s %10s   %12s  %s
+",
+      "", "mean", "median", "p95", "change", "95% CI of difference";
+    for my $row (@rows) {
+      my ($name, $c) = @$row;
+      next unless $c && $c->{baseline};
+      printf "  %-22s %s
+", "$name (baseline)", $fmt->($c->{baseline});
+      my $change = defined $c->{relative_difference_percent}
+        ? sprintf("%+.2f%%", $c->{relative_difference_percent}) : "-";
+      my $ci = $c->{difference_ci_95}
+        ? sprintf("[%+.3f, %+.3f]%s", @{ $c->{difference_ci_95} },
+                  ($c->{interval_excludes_zero} ? "" : "  (includes zero)"))
+        : "-";
+      printf "  %-22s %s   %12s  %s
+", "$name (candidate)", $fmt->($c->{candidate}), $change, $ci;
+      print "
+";
+    }
+
+    if (@{ $r->{constraints} || [] }) {
+      print "  constraints
+";
+      for my $c (@{ $r->{constraints} }) {
+        my $mark = $c->{status} eq "passed" ? "pass"
+                 : $c->{status} eq "failed" ? "FAIL" : "????";
+        printf "    %-6s %-24s%s
+", $mark, $c->{expression},
+          (defined $c->{observed} ? sprintf("observed %.4f", $c->{observed})
+                                  : ($c->{reason} || ""));
+      }
+      print "
+";
+    }
+    print "  ", $r->{note}, "
+";
+  '
+}
+
+# Subcommand: summarize one execution for a human reader
+cmd_report() {
+  dir="$1"
+  [ -n "$dir" ] || error "report requires a result directory"
+  [ -f "$dir/benchmark.json" ] || error "no benchmark.json in $dir"
+  check_dependencies
+  perl -MJSON::PP -e '
+    open my $fh, "<", $ARGV[0] or die "cannot read $ARGV[0]
+";
+    my $d = JSON::PP->new->decode(do { local $/; <$fh> });
+    printf "%s
+", (defined $d->{name} ? $d->{name} : "benchmark");
+    printf "  command      %s
+", $d->{command};
+    printf "  message      %s
+", $d->{message} if length($d->{message} // "");
+    printf "  runs         %d completed, %d valid, %d invalid
+",
+      $d->{runs_completed}, $d->{runs_valid} // $d->{runs_completed},
+      ($d->{runs_completed} - ($d->{runs_valid} // $d->{runs_completed}));
+    my $t = $d->{timing};
+    printf "  timing (ms)  mean %.3f  median %.3f  p95 %.3f  stddev %.3f
+",
+      $t->{mean}, $t->{median}, $t->{p95}, $t->{stddev};
+    if (ref $d->{validity} eq "HASH") {
+      my @bad = grep { $_ ne "ok" && $d->{validity}{$_} } sort keys %{ $d->{validity} };
+      printf "  failures     %s
+", join(", ", map { "$_=$d->{validity}{$_}" } @bad) if @bad;
+    }
+    if (ref $d->{metrics} eq "HASH" && keys %{ $d->{metrics} }) {
+      print "  metrics
+";
+      for my $m (sort keys %{ $d->{metrics} }) {
+        my $e = $d->{metrics}{$m};
+        printf "    %-24s mean %-12.4f n=%-4d", $m, $e->{mean}, $e->{count};
+        printf "  valid-only mean %.4f (n=%d)",
+          $e->{valid_only}{mean}, $e->{valid_only}{count}
+          if ref $e->{valid_only} eq "HASH" && $e->{valid_only}{count};
+        print "
+";
+      }
+    }
+    my $p = $d->{provenance};
+    if (ref $p eq "HASH") {
+      printf "  fingerprint  %s
+", substr($p->{config_fingerprint}, 0, 16);
+      printf "  git          %s%s
+", substr($p->{git}{commit}, 0, 12),
+        ($p->{git}{dirty} ? " (dirty)" : "") if ref $p->{git} eq "HASH";
+      printf "  resumed      %d time(s)
+", scalar @{ $p->{resumes} }
+        if ref $p->{resumes} eq "ARRAY" && @{ $p->{resumes} };
+    }
+  ' "$dir/benchmark.json"
+  exit 0
+}
+
 # Main entry point
 main() {
   # Default values
@@ -1172,6 +2327,34 @@ TZ
 TERM"
   RESUME_DIR=""
   FORCE_RESUME=0
+  VARIANT_SPEC=""      # "<name>\t<command>" per line, from a manifest
+  VARIANT_ENV_SRC=""   # directory of per-variant env files
+  ORDER="interleaved"
+  SEED=42
+  SETUP_CMD=""
+  CLEANUP_CMD=""
+  SETUP_SCOPE="experiment"
+  CLEANUP_SCOPE="experiment"
+  WARMUP=0
+  TIMEOUT=""
+
+  # Subcommand dispatch.
+  #
+  # Only the first argument is examined, and only when it is not an option, so
+  # `bench compare-throughput.sh` still benchmarks a command with that name.
+  case "$1" in
+    validate) shift; cmd_validate "$@" ;;
+    compare)  shift; cmd_compare "$@" ;;
+    report)   shift; cmd_report "$@" ;;
+    run)
+      shift
+      load_manifest "$@"
+      # Re-enter argument parsing with only the flags that followed the
+      # manifest, so --quiet, --resume and friends still apply to a manifest run
+      # shellcheck disable=SC2086
+      set -- $MANIFEST_EXTRA_ARGS
+      ;;
+  esac
 
   # Parse arguments
   while [ $# -gt 0 ]; do
@@ -1532,6 +2715,10 @@ $1"
   EXIT_CODES_FILE=$(mktemp)
   RUNS_FILE=$(mktemp)
   MEASUREMENTS_FILE=$(mktemp)
+  BASE_TEMP_FILES="$TIMES_FILE
+$EXIT_CODES_FILE
+$RUNS_FILE
+$MEASUREMENTS_FILE"
   write_ingest_helper
   write_aggregate_helper
   write_provenance_helper
@@ -1648,13 +2835,112 @@ $1"
     initial_metrics=$(echo "$initial_metrics" | sed 's/^ *//')
   fi
 
-  if [ "$QUIET" -eq 0 ]; then
-    echo "Running '$COMMAND' $RUNS times..." >&2
+  # ---------------------------------------------------------------------------
+  # Variants and execution schedule
+  # ---------------------------------------------------------------------------
+  VARIANT_WORK=$(mktemp -d)
+  SCHEDULE_FILE=$(mktemp)
+  # Held separately because select_variant rebinds OUTPUT_DIR to each variant's
+  # directory as the schedule runs
+  EXECUTION_DIR="$OUTPUT_DIR"
+
+  if [ -z "$VARIANT_SPEC" ]; then
+    # Plain benchmark: one unnamed variant writing straight to OUTPUT_DIR
+    MULTI_VARIANT=0
+    register_variant "default" "$COMMAND" "$OUTPUT_DIR"
+    # A resume restored the prior runs into the top-level accumulators before
+    # variants existed; hand them to the single variant that owns them now.
+    if [ -n "$RESUME_DIR" ]; then
+      cp "$RUNS_FILE"         "$VARIANT_WORK/default/runs"
+      cp "$TIMES_FILE"        "$VARIANT_WORK/default/times"
+      cp "$EXIT_CODES_FILE"   "$VARIANT_WORK/default/exits"
+      cp "$MEASUREMENTS_FILE" "$VARIANT_WORK/default/measurements"
+    fi
+    r="$run_start"
+    while [ "$r" -le "$RUNS" ]; do
+      echo "default $r" >> "$SCHEDULE_FILE"
+      r=$((r + 1))
+    done
+  else
+    MULTI_VARIANT=1
+    # Each variant gets a complete, self-contained result directory, so every
+    # downstream tool -- compare, resume, jq -- works on it unchanged.
+    printf '%s\n' "$VARIANT_SPEC" | while IFS='	' read -r vname vcmd; do
+      [ -n "$vname" ] || continue
+      printf '%s\t%s\n' "$vname" "$vcmd"
+    done > "$VARIANT_WORK/spec"
+
+    while IFS='	' read -r vname vcmd; do
+      [ -n "$vname" ] || continue
+      [ -n "$vcmd" ] || vcmd="$COMMAND"
+      register_variant "$vname" "$vcmd" "$OUTPUT_DIR/variants/$vname"
+      if [ -f "$VARIANT_ENV_SRC/$vname" ]; then
+        cp "$VARIANT_ENV_SRC/$vname" "$VARIANT_WORK/$vname/env"
+      fi
+    done < "$VARIANT_WORK/spec"
+
+    build_schedule "$RUNS" "$ORDER" "$SEED" > "$SCHEDULE_FILE"
   fi
 
-  while [ "$run_num" -le "$RUNS" ] && [ "$INTERRUPTED" -eq 0 ]; do
+  run_hook "$SETUP_CMD" "$SETUP_SCOPE" experiment "setup"
+
+  # Per-variant setup and warm-up happen before any measured run, so warm-up
+  # work never lands in the recorded sample.
+  if [ "$WARMUP" -gt 0 ] || [ -n "$SETUP_CMD" ]; then
+    printf '%s' "$VARIANT_NAMES" | grep . > "$VARIANT_WORK/prepare"
+    while IFS= read -r prep_variant; do
+      [ -n "$prep_variant" ] || continue
+      CURRENT_VARIANT=""
+      select_variant "$prep_variant"
+      run_hook "$SETUP_CMD" "$SETUP_SCOPE" variant "setup"
+      w=1
+      while [ "$w" -le "$WARMUP" ]; do
+        _wu_cmd="$COMMAND"
+        if [ -n "$VARIANT_ENV_FILE" ] && [ -s "$VARIANT_ENV_FILE" ]; then
+          _wu_cmd="$(cat "$VARIANT_ENV_FILE") $COMMAND"
+        fi
+        BENCH_RUN_DIR="$VARIANT_WORK/$prep_variant/warmup" \
+        BENCH_RESULT_JSON="$VARIANT_WORK/$prep_variant/warmup/result.json" \
+        BENCH_METRICS="$VARIANT_WORK/$prep_variant/warmup/metrics.jsonl" \
+        BENCH_ARTIFACTS="$VARIANT_WORK/$prep_variant/warmup" \
+        BENCH_RUN_NUMBER="0" \
+        BENCH_RUNS="$RUNS" \
+        BENCH_WARMUP="1" \
+          sh -c "$_wu_cmd" >/dev/null 2>&1 || true
+        w=$((w + 1))
+      done
+    done < "$VARIANT_WORK/prepare"
+    CURRENT_VARIANT=""
+  fi
+
+  if [ "$QUIET" -eq 0 ]; then
+    if [ "$MULTI_VARIANT" -eq 1 ]; then
+      echo "Running $(printf '%s' "$VARIANT_NAMES" | grep -c .) variants x $RUNS runs ($ORDER order, seed $SEED)..." >&2
+    else
+      echo "Running '$COMMAND' $RUNS times..." >&2
+    fi
+  fi
+
+  # The loop is driven by a schedule of "<variant> <run number>" entries. A
+  # plain `bench "command"` has one variant and a 1..N schedule, so the body
+  # below is unchanged for it; an experiment with variants interleaves them in
+  # this file instead of running each variant to completion in turn, which
+  # would confound the comparison with drift in machine state over time.
+  while IFS=' ' read -r sched_variant run_num; do
+    [ -n "$sched_variant" ] || continue
+    [ "$INTERRUPTED" -eq 0 ] || break
+
+    # Switch to this variant's context: its command, output directory and
+    # accumulator files. For the single-variant case these never change.
+    select_variant "$sched_variant"
+    run_hook "$SETUP_CMD" "$SETUP_SCOPE" run "setup"
+
     if [ "$QUIET" -eq 0 ]; then
-      printf "\r  Run %d/%d" "$run_num" "$RUNS" >&2
+      if [ "$MULTI_VARIANT" -eq 1 ]; then
+        printf "\r  %-20s run %d/%d" "$sched_variant" "$run_num" "$RUNS" >&2
+      else
+        printf "\r  Run %d/%d" "$run_num" "$RUNS" >&2
+      fi
     fi
 
     # Capture timestamps and timing
@@ -1686,13 +2972,25 @@ $1"
     # than looking like a run that simply produced no evidence.
     : > "$run_dir/INCOMPLETE"
 
+    # A variant's environment is applied here rather than exported into bench,
+    # so settings cannot leak from one variant into the next.
+    run_cmd="$COMMAND"
+    if [ -n "$VARIANT_ENV_FILE" ] && [ -s "$VARIANT_ENV_FILE" ]; then
+      run_cmd="$(cat "$VARIANT_ENV_FILE") $COMMAND"
+    fi
+    # A timeout bounds a run that would otherwise hang the whole experiment.
+    if [ -n "$TIMEOUT" ] && command -v timeout >/dev/null 2>&1; then
+      run_cmd="timeout $TIMEOUT sh -c $(quote_for_sh "$run_cmd")"
+    fi
+
     BENCH_RUN_DIR="$run_dir" \
     BENCH_RESULT_JSON="$run_dir/result.json" \
     BENCH_METRICS="$run_dir/metrics.jsonl" \
     BENCH_ARTIFACTS="$run_dir/artifacts" \
     BENCH_RUN_NUMBER="$run_num" \
     BENCH_RUNS="$RUNS" \
-      sh -c "$COMMAND" > "$stdout_file" 2> "$stderr_file" &
+    BENCH_VARIANT="$CURRENT_VARIANT" \
+      sh -c "$run_cmd" > "$stdout_file" 2> "$stderr_file" &
     cmd_pid=$!
     wait $cmd_pid 2>/dev/null
     cmd_exit=$?
@@ -1884,17 +3182,6 @@ $1"
     fi
     rm -f "$run_metrics_tsv"
 
-    # Tally
-    case "$run_status" in
-      ok)                     status_ok=$((status_ok + 1)); runs_valid=$((runs_valid + 1)) ;;
-      command_failed)         status_command_failed=$((status_command_failed + 1)) ;;
-      invalid_result)         status_invalid_result=$((status_invalid_result + 1)) ;;
-      declared_invalid)       status_declared_invalid=$((status_declared_invalid + 1)) ;;
-      evaluator_failed)       status_evaluator_failed=$((status_evaluator_failed + 1)) ;;
-      constraint_failed)      status_constraint_failed=$((status_constraint_failed + 1)) ;;
-      infrastructure_failed)  status_infrastructure_failed=$((status_infrastructure_failed + 1)) ;;
-    esac
-
     run_valid_json=$([ "$run_status" = "ok" ] && echo "true" || echo "false")
 
     # Fold this run's measurements into the global set, tagged with validity
@@ -1922,9 +3209,9 @@ $1"
     echo "$duration_ms" >> "$TIMES_FILE"
     echo "$cmd_exit" >> "$EXIT_CODES_FILE"
 
-    RUNS_COMPLETED=$run_num
-    run_num=$((run_num + 1))
-  done
+    run_hook "$CLEANUP_CMD" "$CLEANUP_SCOPE" run "cleanup"
+    echo "$run_num" >> "$VARIANT_DONE_FILE"
+  done < "$SCHEDULE_FILE"
 
   if [ "$QUIET" -eq 0 ]; then
     echo "" >&2
@@ -1933,228 +3220,252 @@ $1"
   # Re-enable exit on error
   set -e
 
-  # Calculate statistics
-  runs_successful=0
-  runs_failed=0
-  while IFS= read -r code; do
-    if [ "$code" -eq 0 ]; then
-      runs_successful=$((runs_successful + 1))
-    else
-      runs_failed=$((runs_failed + 1))
-    fi
-  done < "$EXIT_CODES_FILE"
+  # ---------------------------------------------------------------------------
+  # Finalize each variant
+  #
+  # Every variant produces a complete, standalone result directory, so an
+  # experiment with variants is a directory of ordinary benchmark results
+  # rather than a new format that tools have to learn.
+  # ---------------------------------------------------------------------------
+  printf '%s' "$VARIANT_NAMES" | grep . > "$VARIANT_WORK/finalize"
+  while IFS= read -r variant_name; do
+    [ -n "$variant_name" ] || continue
+    CURRENT_VARIANT=""
+    select_variant "$variant_name"
 
-  # Calculate timing statistics
-  if [ "$RUNS_COMPLETED" -gt 0 ]; then
-    # Sort times for median/percentiles
-    sorted_times=$(sort -n "$TIMES_FILE")
-
-    # Min/Max
-    time_min=$(echo "$sorted_times" | head -1)
-    time_max=$(echo "$sorted_times" | tail -1)
-
-    # Mean
-    time_sum=$(awk '{sum+=$1} END {printf "%.6f", sum}' "$TIMES_FILE")
-    time_mean=$(bc_normalize "scale=6; $time_sum / $RUNS_COMPLETED")
-
-    # Median
-    mid=$((RUNS_COMPLETED / 2))
-    if [ $((RUNS_COMPLETED % 2)) -eq 0 ]; then
-      val1=$(echo "$sorted_times" | sed -n "${mid}p")
-      val2=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
-      time_median=$(bc_normalize "scale=6; ($val1 + $val2) / 2")
-    else
-      time_median=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
-    fi
-
-    # Standard deviation (sample stddev with n-1 denominator)
-    # Formula: sqrt(sum((x - mean)^2) / (n - 1))
-    if [ "$RUNS_COMPLETED" -gt 1 ]; then
-      sum_sq_diff=$(awk -v mean="$time_mean" '{diff=$1-mean; sum+=diff*diff} END {printf "%.6f", sum}' "$TIMES_FILE")
-      time_stddev=$(bc_normalize "scale=6; sqrt($sum_sq_diff / ($RUNS_COMPLETED - 1))")
-    else
-      time_stddev=0
-    fi
-
-    # Percentiles using nearest rank method
-    # Formula: rank = ceil(percentile * n)
-    # p95
-    p95_rank=$(echo "scale=0; ($RUNS_COMPLETED * 95 + 99) / 100" | bc)
-    [ "$p95_rank" -gt "$RUNS_COMPLETED" ] && p95_rank=$RUNS_COMPLETED
-    time_p95=$(echo "$sorted_times" | sed -n "${p95_rank}p")
-
-    # p99
-    p99_rank=$(echo "scale=0; ($RUNS_COMPLETED * 99 + 99) / 100" | bc)
-    [ "$p99_rank" -gt "$RUNS_COMPLETED" ] && p99_rank=$RUNS_COMPLETED
-    time_p99=$(echo "$sorted_times" | sed -n "${p99_rank}p")
-  else
-    time_min=0
-    time_max=0
-    time_mean=0
-    time_median=0
-    time_stddev=0
-    time_p95=0
-    time_p99=0
-  fi
-
-  # Calculate success rate
-  if [ "$RUNS_COMPLETED" -gt 0 ]; then
-    success_rate=$(bc_normalize "scale=2; $runs_successful * 100 / $RUNS_COMPLETED")
-  else
-    success_rate=0
-  fi
-
-  # Calculate aggregate process metrics if monitoring
-  processes_json=""
-  if [ -n "$MONITOR_PROCESSES" ]; then
-    processes_json=",
-  \"processes\": ["
-    first_proc=1
-
-    for entry in $MONITOR_PROCESSES; do
-      proc_name="${entry%%:*}"
-      rest="${entry#*:}"
-      proc_pid="${rest%%:*}"
-      proc_port="${rest#*:}"
-
-      # Get initial memory from saved initial_metrics
-      initial_mem=0
-      for im in $initial_metrics; do
-        im_name="${im%%:*}"
-        im_mem="${im#*:}"
-        if [ "$im_name" = "$proc_name" ]; then
-          initial_mem="$im_mem"
-          break
-        fi
-      done
-
-      # Get final memory for leak detection
-      final_stats=$(get_process_stats "$proc_pid")
-      if [ -n "$final_stats" ]; then
-        final_mem=$(echo "$final_stats" | awk '{print $2}')
-      else
-        final_mem="$initial_mem"
-      fi
-      mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
-
-      # Calculate CPU and memory stats from all .metrics files for this process
-      # Concatenate all metrics files for this process across all runs
-      all_metrics_file=$(mktemp)
-      for metrics_file in "$OUTPUT_DIR/runs/"*."${proc_name}".metrics; do
-        if [ -f "$metrics_file" ]; then
-          cat "$metrics_file" >> "$all_metrics_file"
-        fi
-      done
-
-      if [ -s "$all_metrics_file" ]; then
-        # File format: timestamp cpu:value mem:value
-        # Extract values using sed, then calculate stats
-        cpu_values=$(sed 's/.*cpu:\([0-9.]*\).*/\1/' "$all_metrics_file")
-        mem_values=$(sed 's/.*mem:\([0-9.]*\).*/\1/' "$all_metrics_file")
-
-        cpu_mean=$(echo "$cpu_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
-        cpu_min=$(echo "$cpu_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
-        cpu_max=$(echo "$cpu_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
-
-        mem_mean=$(echo "$mem_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
-        mem_min=$(echo "$mem_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
-        mem_max=$(echo "$mem_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
-      else
-        cpu_mean=0
-        cpu_min=0
-        cpu_max=0
-        mem_mean=0
-        mem_min=0
-        mem_max=0
-      fi
-      rm -f "$all_metrics_file"
-
-      # Add comma separator for subsequent entries
-      if [ "$first_proc" -eq 1 ]; then
-        first_proc=0
-      else
-        processes_json="$processes_json,"
-      fi
-
-      # Build port field only if port was specified
-      port_field=""
-      if [ -n "$proc_port" ]; then
-        port_field="
-      \"port\": $proc_port,"
-      fi
-
-      processes_json="$processes_json
-    {
-      \"name\": \"$proc_name\",
-      \"pid\": $proc_pid,$port_field
-      \"cpu\": {
-        \"unit\": \"percent\",
-        \"mean\": $cpu_mean,
-        \"min\": $cpu_min,
-        \"max\": $cpu_max
-      },
-      \"memory\": {
-        \"unit\": \"megabytes\",
-        \"mean\": $mem_mean,
-        \"min\": $mem_min,
-        \"max\": $mem_max,
-        \"initial\": $initial_mem,
-        \"final\": $final_mem,
-        \"delta\": $mem_delta
-      }
-    }"
+    # Counters come from the recorded runs rather than from the loop, so a
+    # resumed or interleaved execution is counted the same way as a fresh one.
+    run_hook "$CLEANUP_CMD" "$CLEANUP_SCOPE" variant "cleanup"
+    tallies=$(derive_tallies "$RUNS_FILE")
+    RUNS_COMPLETED=$(printf '%s\n' "$tallies" | sed -n 's/^RUNS_COMPLETED=//p')
+    runs_valid=$(printf '%s\n' "$tallies" | sed -n 's/^runs_valid=//p')
+    for st in ok command_failed invalid_result declared_invalid \
+              evaluator_failed constraint_failed infrastructure_failed; do
+      eval "status_${st}=$(printf '%s\n' "$tallies" | sed -n "s/^status_${st}=//p")"
     done
 
-    processes_json="$processes_json
-  ]"
-  fi
+    # Calculate statistics
+    runs_successful=0
+    runs_failed=0
+    while IFS= read -r code; do
+      if [ "$code" -eq 0 ]; then
+        runs_successful=$((runs_successful + 1))
+      else
+        runs_failed=$((runs_failed + 1))
+      fi
+    done < "$EXIT_CODES_FILE"
 
-  # Aggregate raw per-run measurements into per-metric summaries.
-  # A unit conflict across runs is fatal: it means two different quantities
-  # were recorded under one name, and any summary of them would be wrong.
-  metrics_json="{}"
-  if [ -s "$MEASUREMENTS_FILE" ]; then
-    agg_err=$(mktemp)
-    if aggregated=$(perl "$AGGREGATE_PL" "$MEASUREMENTS_FILE" 2>"$agg_err"); then
-      metrics_json="$aggregated"
-      rm -f "$agg_err"
+    # Calculate timing statistics
+    if [ "$RUNS_COMPLETED" -gt 0 ]; then
+      # Sort times for median/percentiles
+      sorted_times=$(sort -n "$TIMES_FILE")
+
+      # Min/Max
+      time_min=$(echo "$sorted_times" | head -1)
+      time_max=$(echo "$sorted_times" | tail -1)
+
+      # Mean
+      time_sum=$(awk '{sum+=$1} END {printf "%.6f", sum}' "$TIMES_FILE")
+      time_mean=$(bc_normalize "scale=6; $time_sum / $RUNS_COMPLETED")
+
+      # Median
+      mid=$((RUNS_COMPLETED / 2))
+      if [ $((RUNS_COMPLETED % 2)) -eq 0 ]; then
+        val1=$(echo "$sorted_times" | sed -n "${mid}p")
+        val2=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
+        time_median=$(bc_normalize "scale=6; ($val1 + $val2) / 2")
+      else
+        time_median=$(echo "$sorted_times" | sed -n "$((mid + 1))p")
+      fi
+
+      # Standard deviation (sample stddev with n-1 denominator)
+      # Formula: sqrt(sum((x - mean)^2) / (n - 1))
+      if [ "$RUNS_COMPLETED" -gt 1 ]; then
+        sum_sq_diff=$(awk -v mean="$time_mean" '{diff=$1-mean; sum+=diff*diff} END {printf "%.6f", sum}' "$TIMES_FILE")
+        time_stddev=$(bc_normalize "scale=6; sqrt($sum_sq_diff / ($RUNS_COMPLETED - 1))")
+      else
+        time_stddev=0
+      fi
+
+      # Percentiles using nearest rank method
+      # Formula: rank = ceil(percentile * n)
+      # p95
+      p95_rank=$(echo "scale=0; ($RUNS_COMPLETED * 95 + 99) / 100" | bc)
+      [ "$p95_rank" -gt "$RUNS_COMPLETED" ] && p95_rank=$RUNS_COMPLETED
+      time_p95=$(echo "$sorted_times" | sed -n "${p95_rank}p")
+
+      # p99
+      p99_rank=$(echo "scale=0; ($RUNS_COMPLETED * 99 + 99) / 100" | bc)
+      [ "$p99_rank" -gt "$RUNS_COMPLETED" ] && p99_rank=$RUNS_COMPLETED
+      time_p99=$(echo "$sorted_times" | sed -n "${p99_rank}p")
     else
-      agg_msg=$(tr '\n' ';' < "$agg_err" | sed 's/;$//; s/;/; /g')
-      rm -f "$agg_err"
-      error "$agg_msg"
+      time_min=0
+      time_max=0
+      time_mean=0
+      time_median=0
+      time_stddev=0
+      time_p95=0
+      time_p99=0
     fi
-  fi
 
-  runs_invalid=$((RUNS_COMPLETED - runs_valid))
-  if [ "$RUNS_COMPLETED" -gt 0 ]; then
-    valid_rate=$(bc_normalize "scale=2; $runs_valid * 100 / $RUNS_COMPLETED")
-  else
-    valid_rate=0
-  fi
+    # Calculate success rate
+    if [ "$RUNS_COMPLETED" -gt 0 ]; then
+      success_rate=$(bc_normalize "scale=2; $runs_successful * 100 / $RUNS_COMPLETED")
+    else
+      success_rate=0
+    fi
 
-  # Escape every user-controlled string exactly once, here, rather than at
-  # each interpolation site. Process names are already restricted to a
-  # JSON-safe character set by sanitize_proc_name/validate_proc_name.
-  name_json=$(json_escape "$NAME")
-  message_json=$(json_escape "$MESSAGE")
-  command_json=$(json_escape "$COMMAND")
-  evaluate_json=$(json_escape "$EVALUATE_CMD")
-  os_json=$(json_escape "$(uname -s)")
-  shell_json=$(json_escape "$SHELL")
-  pwd_json=$(json_escape "$PWD")
+    # Calculate aggregate process metrics if monitoring
+    processes_json=""
+    if [ -n "$MONITOR_PROCESSES" ]; then
+      processes_json=",
+    \"processes\": ["
+      first_proc=1
 
-  # Splice the resume history into the provenance object captured at startup.
-  # Done here rather than in the helper so the history survives a resume of a
-  # resume: each sitting appends to what the previous one recorded.
-  provenance_full=$(printf '%s' "$provenance_json" | sed 's/}$//')
-  provenance_full="$provenance_full,\"resumes\":$resumes_json,\"finished\":\"$(get_iso_timestamp)\"}"
+      for entry in $MONITOR_PROCESSES; do
+        proc_name="${entry%%:*}"
+        rest="${entry#*:}"
+        proc_pid="${rest%%:*}"
+        proc_port="${rest#*:}"
 
-  # Generate JSON output.
-  #
-  # Written in three appends (header, runs array, tail) so the runs array is
-  # streamed straight from the temp file. Accumulating it in a shell variable
-  # re-copied the whole string once per run, which is quadratic in --runs.
-  cat > "$OUTPUT_DIR/benchmark.json" << ENDJSON
+        # Get initial memory from saved initial_metrics
+        initial_mem=0
+        for im in $initial_metrics; do
+          im_name="${im%%:*}"
+          im_mem="${im#*:}"
+          if [ "$im_name" = "$proc_name" ]; then
+            initial_mem="$im_mem"
+            break
+          fi
+        done
+
+        # Get final memory for leak detection
+        final_stats=$(get_process_stats "$proc_pid")
+        if [ -n "$final_stats" ]; then
+          final_mem=$(echo "$final_stats" | awk '{print $2}')
+        else
+          final_mem="$initial_mem"
+        fi
+        mem_delta=$(bc_normalize "scale=2; $final_mem - $initial_mem")
+
+        # Calculate CPU and memory stats from all .metrics files for this process
+        # Concatenate all metrics files for this process across all runs
+        all_metrics_file=$(mktemp)
+        for metrics_file in "$OUTPUT_DIR/runs/"*."${proc_name}".metrics; do
+          if [ -f "$metrics_file" ]; then
+            cat "$metrics_file" >> "$all_metrics_file"
+          fi
+        done
+
+        if [ -s "$all_metrics_file" ]; then
+          # File format: timestamp cpu:value mem:value
+          # Extract values using sed, then calculate stats
+          cpu_values=$(sed 's/.*cpu:\([0-9.]*\).*/\1/' "$all_metrics_file")
+          mem_values=$(sed 's/.*mem:\([0-9.]*\).*/\1/' "$all_metrics_file")
+
+          cpu_mean=$(echo "$cpu_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+          cpu_min=$(echo "$cpu_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
+          cpu_max=$(echo "$cpu_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
+
+          mem_mean=$(echo "$mem_values" | awk '{sum+=$1; count++} END {if(count>0) printf "%.2f", sum/count; else print "0"}')
+          mem_min=$(echo "$mem_values" | awk 'NR==1{min=$1} {if($1<min)min=$1} END{printf "%.2f", min}')
+          mem_max=$(echo "$mem_values" | awk 'NR==1{max=$1} {if($1>max)max=$1} END{printf "%.2f", max}')
+        else
+          cpu_mean=0
+          cpu_min=0
+          cpu_max=0
+          mem_mean=0
+          mem_min=0
+          mem_max=0
+        fi
+        rm -f "$all_metrics_file"
+
+        # Add comma separator for subsequent entries
+        if [ "$first_proc" -eq 1 ]; then
+          first_proc=0
+        else
+          processes_json="$processes_json,"
+        fi
+
+        # Build port field only if port was specified
+        port_field=""
+        if [ -n "$proc_port" ]; then
+          port_field="
+        \"port\": $proc_port,"
+        fi
+
+        processes_json="$processes_json
+      {
+        \"name\": \"$proc_name\",
+        \"pid\": $proc_pid,$port_field
+        \"cpu\": {
+          \"unit\": \"percent\",
+          \"mean\": $cpu_mean,
+          \"min\": $cpu_min,
+          \"max\": $cpu_max
+        },
+        \"memory\": {
+          \"unit\": \"megabytes\",
+          \"mean\": $mem_mean,
+          \"min\": $mem_min,
+          \"max\": $mem_max,
+          \"initial\": $initial_mem,
+          \"final\": $final_mem,
+          \"delta\": $mem_delta
+        }
+      }"
+      done
+
+      processes_json="$processes_json
+    ]"
+    fi
+
+    # Aggregate raw per-run measurements into per-metric summaries.
+    # A unit conflict across runs is fatal: it means two different quantities
+    # were recorded under one name, and any summary of them would be wrong.
+    metrics_json="{}"
+    if [ -s "$MEASUREMENTS_FILE" ]; then
+      agg_err=$(mktemp)
+      if aggregated=$(perl "$AGGREGATE_PL" "$MEASUREMENTS_FILE" 2>"$agg_err"); then
+        metrics_json="$aggregated"
+        rm -f "$agg_err"
+      else
+        agg_msg=$(tr '\n' ';' < "$agg_err" | sed 's/;$//; s/;/; /g')
+        rm -f "$agg_err"
+        error "$agg_msg"
+      fi
+    fi
+
+    runs_invalid=$((RUNS_COMPLETED - runs_valid))
+    if [ "$RUNS_COMPLETED" -gt 0 ]; then
+      valid_rate=$(bc_normalize "scale=2; $runs_valid * 100 / $RUNS_COMPLETED")
+    else
+      valid_rate=0
+    fi
+
+    # Escape every user-controlled string exactly once, here, rather than at
+    # each interpolation site. Process names are already restricted to a
+    # JSON-safe character set by sanitize_proc_name/validate_proc_name.
+    name_json=$(json_escape "$NAME")
+    message_json=$(json_escape "$MESSAGE")
+    command_json=$(json_escape "$COMMAND")
+    evaluate_json=$(json_escape "$EVALUATE_CMD")
+    os_json=$(json_escape "$(uname -s)")
+    shell_json=$(json_escape "$SHELL")
+    pwd_json=$(json_escape "$PWD")
+
+    # Splice the resume history into the provenance object captured at startup.
+    # Done here rather than in the helper so the history survives a resume of a
+    # resume: each sitting appends to what the previous one recorded.
+    provenance_full=$(printf '%s' "$provenance_json" | sed 's/}$//')
+    provenance_full="$provenance_full,\"resumes\":$resumes_json,\"finished\":\"$(get_iso_timestamp)\"}"
+
+    # Generate JSON output.
+    #
+    # Written in three appends (header, runs array, tail) so the runs array is
+    # streamed straight from the temp file. Accumulating it in a shell variable
+    # re-copied the whole string once per run, which is quadratic in --runs.
+    cat > "$OUTPUT_DIR/benchmark.json" << ENDJSON
 {
   "schema_version": "$SCHEMA_VERSION",
   "tool": "bench",
@@ -2202,17 +3513,29 @@ $1"
   "runs": [
 ENDJSON
 
-  # Stream the per-run objects (one JSON object per line in $RUNS_FILE)
-  awk '{ if (NR > 1) printf ",\n"; printf "    %s", $0 }
-       END { if (NR > 0) printf "\n" }' "$RUNS_FILE" >> "$OUTPUT_DIR/benchmark.json"
+    # Stream the per-run objects (one JSON object per line in $RUNS_FILE)
+    awk '{ if (NR > 1) printf ",\n"; printf "    %s", $0 }
+         END { if (NR > 0) printf "\n" }' "$RUNS_FILE" >> "$OUTPUT_DIR/benchmark.json"
 
-  cat >> "$OUTPUT_DIR/benchmark.json" << ENDJSON
+    cat >> "$OUTPUT_DIR/benchmark.json" << ENDJSON
   ]$processes_json
 }
 ENDJSON
 
-  # Cleanup temp files
-  cleanup
+    # Temp files are reclaimed by the EXIT trap once every variant is
+    # finalized; calling cleanup here would delete the schedule and the
+    # remaining variants' accumulators.
+
+  done < "$VARIANT_WORK/finalize"
+
+  # An experiment with variants also records how it was scheduled, so the
+  # result explains the order its observations were taken in.
+  if [ "$MULTI_VARIANT" -eq 1 ]; then
+    write_experiment_json "$EXECUTION_DIR"
+  fi
+  run_hook "$CLEANUP_CMD" "$CLEANUP_SCOPE" experiment "cleanup"
+  OUTPUT_DIR="$EXECUTION_DIR"
+
 
   # Output absolute path
   (cd "$OUTPUT_DIR" && pwd)

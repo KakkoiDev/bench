@@ -1,0 +1,31 @@
+schema_version: "1.0"
+name: algorithm-tuning
+message: is the exact solver worth its extra time
+
+command: ./run.sh
+evaluate: ./grade.sh
+
+runs: 8
+warmup: 1
+timeout: 60s
+order: interleaved
+seed: 42
+
+variants:
+  greedy:
+    env:
+      STRATEGY: "greedy"
+      CAPACITY: "100"
+  exact:
+    env:
+      STRATEGY: "exact"
+      CAPACITY: "100"
+
+metrics:
+  value:
+    goal: maximize
+  solve_ms:
+    goal: minimize
+    unit: ms
+  over_capacity:
+    constraint: "== 0"
