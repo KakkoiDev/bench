@@ -1,0 +1,27 @@
+schema_version: "1.0"
+name: sort-performance
+message: does parallel sort actually help here
+
+command: ./run.sh
+evaluate: ./grade.sh
+
+runs: 8
+warmup: 1
+timeout: 120s
+order: interleaved
+seed: 42
+
+variants:
+  baseline:
+    env:
+      SORT_FLAGS: ""
+  parallel:
+    env:
+      SORT_FLAGS: "--parallel=4"
+
+metrics:
+  sort_ms:
+    goal: minimize
+    unit: ms
+  lines:
+    constraint: "== 20000"

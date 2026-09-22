@@ -277,6 +277,95 @@ failed its checks really happened.
 The full contract for commands and evaluators is in
 [PROTOCOL.md](PROTOCOL.md).
 
+## Experiments with variants
+
+A manifest compares named variants under one configuration:
+
+```yaml
+schema_version: "1.0"
+name: api-cache
+
+command: ./scripts/request.sh
+evaluate: ./scripts/evaluate.sh
+setup: ./scripts/reset-db.sh
+setup_scope: variant
+
+runs: 30
+warmup: 5
+timeout: 60s
+order: interleaved
+seed: 42
+
+variants:
+  baseline:
+    env:
+      CACHE: "false"
+  candidate:
+    env:
+      CACHE: "true"
+
+metrics:
+  latency_ms:
+    goal: minimize
+  errors:
+    constraint: "== 0"
+```
+
+```bash
+bench validate experiment.yaml
+bench run experiment.yaml
+```
+
+Subcommands come first: `bench run exp.yaml --quiet`, not `bench --quiet run`.
+
+Variants are **interleaved** by default rather than run one after the other.
+Temperature, page cache and background activity all drift during a long
+benchmark, and a block design attributes that drift to whichever variant ran
+second. The order actually executed and the seed are recorded in
+`experiment.json`.
+
+Each variant produces a complete, standalone result, so everything else keeps
+working on it:
+
+```
+bench-results/api-cache/<execution>/
+  experiment.json          # order, seed, variants, provenance
+  variants/
+    baseline/benchmark.json
+    candidate/benchmark.json
+```
+
+YAML support is a documented restricted subset — comments, nested maps,
+sequences, quoted scalars — because a full YAML library is not part of core
+Perl and bench takes no third-party dependencies. Anything outside the subset
+is an error rather than a guess, and a `.json` manifest works too.
+
+## Comparing two results
+
+```bash
+bench compare bench-results/api/*/variants/baseline               bench-results/api/*/variants/candidate
+```
+
+```
+baseline  ->  with cache
+
+  baseline   12/12 runs valid (0.0% invalid)
+  candidate  12/12 runs valid (0.0% invalid)
+
+                           mean     median        p95       change  95% CI of difference
+  latency_ms (baseline)  19.000     19.000     20.000
+  latency_ms (candidate) 11.000     11.000     12.000      -42.11%  [-8.667, -7.333]
+```
+
+Intervals are bootstrap percentile intervals over valid runs, seeded so they
+reproduce exactly (`--seed`). An interval excluding zero means the difference is
+**detectable in this sample** — whether it *matters* is a separate question the
+report does not answer.
+
+`--json` emits the same report as machine-readable JSON. `--require "errors == 0"`
+adds a constraint and exits non-zero when it fails, so CI need not parse
+anything. `bench report DIR` summarizes a single execution.
+
 ## Resuming an interrupted benchmark
 
 A long benchmark that is interrupted continues into the same result rather than
@@ -356,6 +445,18 @@ Phases 1 (stable evidence format) and 2 (evaluators and validity) are
 implemented — see [Custom measurements](#custom-measurements) and
 [Independent evaluation](#independent-evaluation). Phases 3–6 (manifests,
 variants, `bench compare`, provenance and resumption) are still proposals.
+
+## Examples
+
+[`examples/`](examples) has a worked adapter per domain — a subject, an
+independent evaluator and a manifest — using only the documented protocol.
+
+Two of them demonstrate the failure this tool exists to catch. In
+[`agent-task/`](examples/agent-task) the overconfident variant writes
+`"valid": true`, exits zero, and scores **zero valid runs** because the
+evaluator runs held-out tests it never saw. In
+[`ci-configuration/`](examples/ci-configuration) a pipeline that goes faster by
+skipping slow tests is measurably faster and entirely invalid.
 
 ## Contributing
 

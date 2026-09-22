@@ -1,0 +1,28 @@
+schema_version: "1.0"
+name: ci-configuration
+message: does skipping slow tests actually pay for the coverage it loses
+
+command: ./run.sh
+evaluate: ./grade.sh
+
+runs: 6
+timeout: 120s
+order: interleaved
+seed: 42
+
+variants:
+  honest:
+    env:
+      SHARDS: "4"
+      SKIP_SLOW: "0"
+  skips-slow-tests:
+    env:
+      SHARDS: "4"
+      SKIP_SLOW: "1"
+
+metrics:
+  wall_ms:
+    goal: minimize
+    unit: ms
+  tests_failed:
+    constraint: "== 0"

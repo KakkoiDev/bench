@@ -1,6 +1,6 @@
 # Bench evidence protocol
 
-Version 2.1.
+Version 2.1 (results), manifest schema 1.0.
 
 This is the contract between bench and the commands it runs. It is written so
 that an adapter can be implemented against this document alone, without reading
@@ -209,7 +209,117 @@ bias the sample toward success.** Only a run interrupted mid-flight — marked b
 Every sitting appends to `provenance.resumes`, so the result carries its own
 history.
 
-## 10. Writing an adapter
+## 10. Experiment manifests
+
+A manifest describes a whole experiment. `bench validate` checks one without
+running it; `bench run` executes it.
+
+```yaml
+schema_version: "1.0"        # required, must be "1.0"
+name: api-cache
+message: does the cache pay for itself
+
+command: ./run.sh            # required
+evaluate: ./grade.sh
+setup: ./reset-db.sh
+cleanup: ./teardown.sh
+setup_scope: variant         # experiment (default), variant, run
+cleanup_scope: variant
+
+runs: 30
+warmup: 5                    # not recorded in the sample
+timeout: 60s                 # 30, 30s, 5m or 1h
+expect_exit: 0               # or "any"
+order: interleaved           # interleaved (default), random, sequential
+seed: 42
+
+variants:
+  baseline:
+    env:
+      CACHE: "false"
+  candidate:
+    env:
+      CACHE: "true"
+    command: ./run-alt.sh    # optional per-variant override
+
+metrics:
+  latency_ms:
+    goal: minimize           # minimize or maximize
+    unit: ms
+  errors:
+    constraint: "== 0"       # same grammar as --require
+
+require_artifacts:
+  - report.json
+capture_env:
+  - CI
+```
+
+**Unknown fields are errors**, not warnings. A misspelled key that is silently
+dropped produces an experiment that is not the one that was written.
+
+**YAML support is a documented subset**: comments, `key: value`, nested maps by
+indentation, `- item` sequences, quoted scalars, numbers, booleans and null.
+Anchors, aliases, flow collections (`{a: 1}`), multi-line scalars and tabs for
+indentation are refused rather than guessed at. A full YAML library is not part
+of core Perl, and bench takes no third-party dependencies. A `.json` manifest is
+accepted as an alternative and is parsed by JSON::PP.
+
+### Variants
+
+Each variant produces a complete, standalone result directory:
+
+```
+bench-results/<name>/<execution>/
+  experiment.json            order, seed, variants, provenance
+  variants/
+    baseline/benchmark.json  an ordinary schema 2.1 result
+    candidate/benchmark.json
+```
+
+Every tool that works on a plain result works on a variant's result, because it
+is one. A variant's `env` is applied to its command and to its lifecycle hooks,
+never exported into bench itself, so settings cannot leak between variants.
+
+Commands also receive `BENCH_VARIANT`, and warm-up invocations receive
+`BENCH_WARMUP=1`.
+
+### Execution order
+
+`interleaved` (the default) rotates the variant order each round. Running every
+baseline observation and then every candidate one lets drift in machine state —
+temperature, page cache, background activity, time of day — land entirely on
+whichever variant ran second. `random` shuffles each round from `seed`;
+`sequential` runs each variant to completion and exists only for cases where
+switching between variants is itself expensive.
+
+The order actually executed is written to `experiment.json` alongside the seed,
+so the schedule is evidence rather than something to take on trust.
+
+## 11. Comparison
+
+```sh
+bench compare BASELINE CANDIDATE [--json] [--seed N] [--require EXPR]
+```
+
+Reports sample counts, invalid-run rates, mean/median/min/max/stddev/p95/p99,
+absolute and relative difference, a 95% confidence interval for the difference,
+and a paired statistic when the samples are the same size.
+
+**Intervals are bootstrap percentile intervals**, not t-intervals: benchmark
+samples are routinely skewed and multi-modal, and the bootstrap assumes no
+distribution. Resampling uses an explicit linear congruential generator seeded
+from `--seed`, so an interval reproduces on any machine and any Perl build
+rather than depending on the platform's `rand()`.
+
+**Comparison uses valid runs only.** A run that failed its checks did not do the
+work being timed.
+
+An interval that excludes zero means the difference is *detectable in this
+sample*. Whether it matters is a question about the system, and the report says
+so rather than implying otherwise. A violated `--require` exits non-zero.
+
+## 12. Writing an adapter
 
 A minimal adapter in POSIX shell:
 

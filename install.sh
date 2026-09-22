@@ -3,7 +3,7 @@
 # Installs bench binary and optionally Claude Code skill + agent
 set -e
 
-VERSION="2.4.0"
+VERSION="3.0.0"
 REPO_URL="https://raw.githubusercontent.com/KakkoiDev/bench/main"
 
 # Detect local vs remote (curl | sh) mode

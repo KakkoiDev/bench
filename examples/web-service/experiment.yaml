@@ -1,0 +1,30 @@
+schema_version: "1.0"
+name: web-service
+message: request batching under a fixed server
+
+command: ./run.sh
+evaluate: ./grade.sh
+setup: ./serve.sh start
+cleanup: ./serve.sh stop
+setup_scope: experiment
+cleanup_scope: experiment
+
+runs: 6
+warmup: 1
+timeout: 60s
+
+variants:
+  light:
+    env:
+      REQUESTS: "10"
+  heavy:
+    env:
+      REQUESTS: "40"
+
+metrics:
+  ms_per_request:
+    goal: minimize
+    unit: ms
+  failed:
+    goal: minimize
+    constraint: "== 0"
