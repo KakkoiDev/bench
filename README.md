@@ -138,6 +138,9 @@ Options:
   --expect-exit CODE  Exit code the command must return, or "any" (default: 0)
   --require EXPR      Hard constraint on a metric, e.g. "errors == 0"
   --require-artifact PATH   Artifact that must exist after the run
+  --capture-env VAR   Record an environment variable in provenance
+  --resume DIR        Continue an interrupted benchmark
+  --force-resume      Resume despite a configuration change (recorded)
   --help              Show help
   --version           Show version
 ```
@@ -258,6 +261,57 @@ Statuses are `ok`, `command_failed`, `invalid_result`, `declared_invalid`,
 `evaluator_failed`, `constraint_failed` and `infrastructure_failed`. Note that
 `runs_successful` counts exit codes while `runs_valid` counts validated runs —
 they are deliberately different numbers.
+
+Each metric is summarized twice: over every run, and over validated runs only.
+
+```bash
+jq '.metrics.tokens | {mean, valid_only}' bench-results/*/*/benchmark.json
+# { "mean": 1400, "valid_only": { "count": 8, "mean": 1250 } }
+```
+
+Cost per *verified* unit of work is usually the figure that matters; `mean`
+answers the different question of cost per attempt. Observations from invalid
+runs are kept rather than dropped — a run that burned the resource and then
+failed its checks really happened.
+
+The full contract for commands and evaluators is in
+[PROTOCOL.md](PROTOCOL.md).
+
+## Resuming an interrupted benchmark
+
+A long benchmark that is interrupted continues into the same result rather than
+starting a second partial one:
+
+```bash
+bench --runs 500 --evaluate ./grade.sh ./run-agent.sh
+# ^C after 120 runs
+bench --runs 500 --evaluate ./grade.sh --resume bench-results/run-agent-sh/20260922-084500-123 ./run-agent.sh
+```
+
+Before resuming, bench checks that the configuration fingerprint still matches —
+same command, run count, exit requirement, evaluator and constraints. If it does
+not, the resume is refused; `--force-resume` proceeds and records the override in
+the result, so a reader can see the sample is not homogeneous.
+
+Runs already recorded are kept, **including ones that completed and were judged
+invalid**: re-rolling failures until they pass would bias the sample toward
+success. Only the run that was in flight when the interrupt landed — marked
+`INCOMPLETE`, with no record written — is discarded and redone.
+
+## Provenance
+
+Every result records what produced it: configuration fingerprint, machine and
+kernel, tool versions, and git commit with dirty state.
+
+```bash
+jq '.provenance | {config_fingerprint, git, machine}' bench-results/*/*/benchmark.json
+```
+
+The environment is never dumped. Only variables named with `--capture-env` are
+recorded, and credential-shaped names (`KEY`, `TOKEN`, `SECRET`, `PASSWORD`,
+`CREDENTIAL`, `AUTH`, `SESSION`, `COOKIE`) are refused even when explicitly
+requested. The number of variables left out is recorded so the omission is
+visible.
 
 ## With other tools
 

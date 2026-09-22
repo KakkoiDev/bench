@@ -43,7 +43,7 @@
 
 set -e
 
-VERSION="2.3.0"
+VERSION="2.4.0"
 SCHEMA_VERSION="2.1"
 
 # Global state for signal handling
@@ -59,6 +59,8 @@ RUNS_FILE=""
 MEASUREMENTS_FILE=""
 INGEST_PL=""
 AGGREGATE_PL=""
+PROVENANCE_PL=""
+RESUME_PL=""
 REQUIRE_FILE=""
 
 # Release resources that would otherwise outlive the script.
@@ -79,6 +81,8 @@ cleanup() {
   [ -n "$MEASUREMENTS_FILE" ] && rm -f "$MEASUREMENTS_FILE"
   [ -n "$INGEST_PL" ] && rm -f "$INGEST_PL"
   [ -n "$AGGREGATE_PL" ] && rm -f "$AGGREGATE_PL"
+  [ -n "$PROVENANCE_PL" ] && rm -f "$PROVENANCE_PL"
+  [ -n "$RESUME_PL" ] && rm -f "$RESUME_PL"
   [ -n "$REQUIRE_FILE" ] && rm -f "$REQUIRE_FILE"
   return 0
 }
@@ -122,6 +126,11 @@ Options:
   --require-artifact PATH
                       Artifact that must exist under the run directory
                       (repeatable)
+
+  --capture-env VAR   Record this environment variable in provenance
+                      (repeatable; never captures credential-shaped names)
+  --resume DIR        Continue an interrupted benchmark in DIR
+  --force-resume      Resume even if the configuration fingerprint differs
 
   --help              Show help
   --version           Show version
@@ -562,18 +571,19 @@ use warnings;
 use JSON::PP;
 
 my ($path) = @ARGV;
-my (%vals, %runs, %unit, @order, @errors);
+my (%vals, %runs, %unit, %valid_vals, @order, @errors);
 
 if (defined $path && -e $path && open my $fh, '<', $path) {
   while (my $line = <$fh>) {
     chomp $line;
     next unless length $line;
-    my ($run, $name, $value, $u) = split /\t/, $line, 4;
+    my ($run, $name, $value, $u, $valid) = split /\t/, $line, 5;
     next unless defined $name && defined $value;
     $u = '' unless defined $u;
     push @order, $name unless exists $vals{$name};
     push @{ $vals{$name} }, $value + 0;
     push @{ $runs{$name} }, $run + 0;
+    push @{ $valid_vals{$name} }, $value + 0 if defined $valid && $valid eq '1';
     if (length $u) {
       # A unit that disagrees between runs makes the values incomparable
       if (exists $unit{$name} && $unit{$name} ne $u) {
@@ -631,6 +641,32 @@ for my $name (@order) {
     runs   => $runs{$name},
   );
   $entry{unit} = $unit{$name} if exists $unit{$name};
+
+  # Summary restricted to runs that passed validation.
+  #
+  # Cost and quality per *verified* unit of work is usually the figure that
+  # matters: a run that burned the resource and then failed its checks is a
+  # real observation, but averaging it in answers a different question. Both
+  # are reported so neither has to be recomputed by hand.
+  my $vv = $valid_vals{$name};
+  if ($vv && @$vv) {
+    my ($vmin, $vmax, $vsum) = ($vv->[0], $vv->[0], 0);
+    for my $x (@$vv) {
+      $vmin = $x if $x < $vmin;
+      $vmax = $x if $x > $vmax;
+      $vsum += $x;
+    }
+    my $vmean = $vsum / scalar(@$vv);
+    $entry{valid_only} = {
+      count  => scalar(@$vv),
+      min    => num($vmin),
+      max    => num($vmax),
+      mean   => num($vmean),
+      median => num(median($vv)),
+    };
+  } else {
+    $entry{valid_only} = { count => 0 };
+  }
   $out{$name} = \%entry;
 }
 
@@ -695,6 +731,239 @@ validate_constraint() {
   return 0
 }
 
+# Write the provenance helper to a temp file
+#
+# Captures the context needed to interpret and reproduce a result, and the
+# configuration fingerprint that a resume is checked against.
+write_provenance_helper() {
+  PROVENANCE_PL=$(mktemp)
+  cat > "$PROVENANCE_PL" << 'PROV_EOF'
+#!/usr/bin/perl
+# Emit the provenance object for a benchmark.
+#
+# Usage: provenance.pl <config-file> <env-allow-file> <results-root>
+#   <config-file>    one "key\tvalue" line per configuration input; the
+#                    fingerprint is taken over this file's canonical form
+#   <env-allow-file> one environment variable name per line to capture
+#
+# Prints: FINGERPRINT\t<sha256>
+#         JSON\t<compact provenance object>
+#
+# Environment handling follows the rule that a result must never carry a dump
+# of the environment it ran in. Only named variables are captured, names that
+# look like credentials are refused even when explicitly requested, and the
+# count of everything left out is recorded so the omission is visible.
+use strict;
+use warnings;
+use JSON::PP;
+use Digest::SHA qw(sha256_hex);
+
+my ($config_path, $env_allow_path, $results_root) = @ARGV;
+$results_root = 'bench-results' unless defined $results_root && length $results_root;
+
+# ---- configuration fingerprint ----------------------------------------------
+my @config;
+if (defined $config_path && open my $fh, '<', $config_path) {
+  while (my $line = <$fh>) { chomp $line; push @config, $line if length $line; }
+  close $fh;
+}
+# Sorted so that flag order on the command line cannot change the fingerprint
+my $canonical = join("\n", sort @config);
+my $fingerprint = sha256_hex($canonical);
+
+# ---- git --------------------------------------------------------------------
+sub run_cmd {
+  my ($cmd) = @_;
+  my $out = `$cmd 2>/dev/null`;
+  return undef if $? != 0;
+  chomp $out;
+  return length $out ? $out : undef;
+}
+
+my $git;
+if (defined run_cmd('git rev-parse --is-inside-work-tree')) {
+  my $commit = run_cmd('git rev-parse HEAD');
+  my $branch = run_cmd('git rev-parse --abbrev-ref HEAD');
+  # Bench's own results directory is excluded from the dirty check. Without
+  # that, "dirty" would report true on every resume simply because the earlier
+  # sitting left its output on disk -- which says nothing about whether the
+  # recorded commit still describes the code that ran.
+  my $status = `git status --porcelain 2>/dev/null`;
+  my $dirty = 0;
+  if (defined $status) {
+    for my $line (split /\n/, $status) {
+      next unless $line =~ /\S/;
+      my $path = length($line) > 3 ? substr($line, 3) : '';
+      $path =~ s/^"//; $path =~ s/"$//;
+      next if $path =~ m{(?:^|/)\Q$results_root\E/};
+      $dirty = 1;
+      last;
+    }
+  }
+  $git = {
+    commit => $commit,
+    branch => $branch,
+    # A dirty tree means the recorded commit does not describe what ran
+    dirty  => $dirty ? JSON::PP::true : JSON::PP::false,
+  };
+}
+
+# ---- machine ----------------------------------------------------------------
+my $cpus = run_cmd('getconf _NPROCESSORS_ONLN');
+my $mem_mb;
+if (open my $mi, '<', '/proc/meminfo') {
+  while (my $l = <$mi>) { if ($l =~ /^MemTotal:\s+(\d+)/) { $mem_mb = int($1 / 1024); last; } }
+  close $mi;
+} else {
+  my $bytes = run_cmd('sysctl -n hw.memsize');   # macOS
+  $mem_mb = int($bytes / 1048576) if defined $bytes && $bytes =~ /^\d+$/;
+}
+
+my $machine = {
+  os     => scalar(run_cmd('uname -s')),
+  kernel => scalar(run_cmd('uname -r')),
+  arch   => scalar(run_cmd('uname -m')),
+};
+$machine->{cpus} = $cpus + 0 if defined $cpus && $cpus =~ /^\d+$/;
+$machine->{memory_mb} = $mem_mb + 0 if defined $mem_mb;
+
+# ---- tool versions ----------------------------------------------------------
+my %tools;
+my $perl_v = sprintf('%vd', $^V);
+$tools{perl} = $perl_v if defined $perl_v;
+my $bc_v = run_cmd('bc --version | head -1');
+$tools{bc} = $bc_v if defined $bc_v;
+my $git_v = run_cmd('git --version');
+$tools{git} = $git_v if defined $git_v;
+
+# ---- environment ------------------------------------------------------------
+my @allow;
+if (defined $env_allow_path && open my $eh, '<', $env_allow_path) {
+  while (my $l = <$eh>) { chomp $l; push @allow, $l if length $l; }
+  close $eh;
+}
+
+# Refused regardless of the allowlist: a result file is shared, and a captured
+# credential cannot be un-shared.
+my $secretish = qr/(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL|AUTH|SESSION|COOKIE)/i;
+
+my (%captured, @redacted);
+my %seen;
+for my $name (@allow) {
+  next if $seen{$name}++;
+  if ($name =~ $secretish) { push @redacted, $name; next; }
+  $captured{$name} = $ENV{$name} if exists $ENV{$name};
+}
+my $omitted = scalar(grep { !exists $captured{$_} } keys %ENV);
+
+my $prov = {
+  config_fingerprint => $fingerprint,
+  machine            => $machine,
+  tools              => \%tools,
+  environment        => {
+    captured      => \%captured,
+    redacted      => [ sort @redacted ],
+    omitted_count => $omitted,
+  },
+};
+$prov->{git} = $git if defined $git;
+
+print "FINGERPRINT\t$fingerprint\n";
+print "JSON\t", JSON::PP->new->canonical->encode($prov), "\n";
+exit 0;
+PROV_EOF
+}
+
+# Write the resume-state helper to a temp file
+#
+# Rehydrates the working files bench keeps during a benchmark from a previous
+# benchmark.json, so that a resumed run continues into exactly the same
+# machinery a fresh run uses and the final aggregation is computed over the
+# combined sample.
+write_resume_helper() {
+  RESUME_PL=$(mktemp)
+  cat > "$RESUME_PL" << 'RESUME_EOF'
+#!/usr/bin/perl
+# Load prior state from an interrupted benchmark.
+#
+# Usage: resume.pl <benchmark.json> <runs-out> <times-out> <exits-out> <measurements-out>
+#
+# Prints one key=value line per restored counter, plus the stored
+# configuration needed to verify the resume:
+#   COMPLETED=<n>  VALID=<n>  REQUESTED=<n>  FINGERPRINT=<hex>
+#   STATUS_<name>=<n>
+#   CONFIG_<key>=<value>
+#
+# Runs already recorded are kept exactly as they were. Only runs that never
+# produced a record are re-run: a run that completed and was judged invalid is
+# a real observation, and re-rolling it until it passes would bias the sample
+# toward success, which is precisely what this tool exists to prevent.
+use strict;
+use warnings;
+use JSON::PP;
+
+my ($json_path, $runs_out, $times_out, $exits_out, $meas_out) = @ARGV;
+
+open my $in, '<', $json_path or die "cannot read $json_path: $!\n";
+my $txt = do { local $/; <$in> };
+close $in;
+
+my $data = eval { JSON::PP->new->decode($txt) };
+die "prior benchmark.json is not valid JSON\n" if $@ || ref $data ne 'HASH';
+
+my $runs = $data->{runs};
+$runs = [] unless ref $runs eq 'ARRAY';
+
+open my $ro, '>', $runs_out  or die "cannot write $runs_out: $!\n";
+open my $to, '>', $times_out or die "cannot write $times_out: $!\n";
+open my $eo, '>', $exits_out or die "cannot write $exits_out: $!\n";
+open my $mo, '>', $meas_out  or die "cannot write $meas_out: $!\n";
+
+my $enc = JSON::PP->new->canonical;
+my %status_counts;
+my $valid = 0;
+
+for my $r (@$runs) {
+  next unless ref $r eq 'HASH';
+  print $ro $enc->encode($r), "\n";
+  print $to (defined $r->{duration_ms} ? $r->{duration_ms} : 0), "\n";
+  print $eo (defined $r->{exit_code}   ? $r->{exit_code}   : 0), "\n";
+
+  my $st = defined $r->{status} ? $r->{status} : 'ok';
+  $status_counts{$st}++;
+  $valid++ if $r->{valid};
+
+  my $ev = $r->{evidence};
+  if (ref $ev eq 'HASH' && ref $ev->{metrics} eq 'HASH') {
+    my $units = ref $ev->{units} eq 'HASH' ? $ev->{units} : {};
+    for my $name (sort keys %{ $ev->{metrics} }) {
+      my $u = defined $units->{$name} ? $units->{$name} : '';
+      print $mo join("\t", $r->{run_number}, $name, $ev->{metrics}{$name}, $u,
+                            ($r->{valid} ? 1 : 0)), "\n";
+    }
+  }
+}
+close $ro; close $to; close $eo; close $mo;
+
+printf "COMPLETED=%d\n", scalar(@$runs);
+printf "VALID=%d\n", $valid;
+printf "REQUESTED=%d\n", (defined $data->{runs_requested} ? $data->{runs_requested} : scalar(@$runs));
+printf "STATUS_%s=%d\n", $_, $status_counts{$_} for sort keys %status_counts;
+
+my $prov = ref $data->{provenance} eq 'HASH' ? $data->{provenance} : {};
+printf "FINGERPRINT=%s\n", (defined $prov->{config_fingerprint} ? $prov->{config_fingerprint} : '');
+
+# Values the resumed invocation must reproduce
+printf "CONFIG_command=%s\n", (defined $data->{command} ? $data->{command} : '');
+printf "CONFIG_name=%s\n",    (defined $data->{name}    ? $data->{name}    : '');
+printf "CONFIG_message=%s\n", (defined $data->{message} ? $data->{message} : '');
+
+# Prior resume history, re-emitted so it can be carried forward
+printf "RESUMES=%s\n", $enc->encode(ref $prov->{resumes} eq 'ARRAY' ? $prov->{resumes} : []);
+exit 0;
+RESUME_EOF
+}
+
 # Generate auto-name from command
 # Algorithm: Remove quotes/special chars → lowercase → spaces to dashes → remove consecutive dashes → truncate 50 → trim trailing dashes
 # Falls back to "benchmark" if result is empty (e.g., command is all special chars)
@@ -734,6 +1003,12 @@ check_dependencies() {
   # evidence a benchmarked command emits)
   if ! perl -MJSON::PP -e 'exit 0' 2>/dev/null; then
     error "Required Perl module 'JSON::PP' not found. Please install libjson-pp-perl or equivalent."
+  fi
+
+  # Check for Digest::SHA (core Perl since 5.10; used to fingerprint the
+  # configuration so a resumed run can prove it matches)
+  if ! perl -MDigest::SHA -e 'exit 0' 2>/dev/null; then
+    error "Required Perl module 'Digest::SHA' not found. Please install libdigest-sha-perl or equivalent."
   fi
 }
 
@@ -888,6 +1163,15 @@ main() {
   EXPECT_EXIT=0         # Exit code the command must return ("any" to accept all)
   REQUIRE_FILE=""       # Temp file holding one --require expression per line
   REQUIRE_ARTIFACTS=""  # Newline-separated required artifact paths
+  # Environment variables captured into provenance. Deliberately short: a
+  # result file is shared, so capture is opt-in rather than opt-out.
+  CAPTURE_ENV="LANG
+LC_ALL
+LC_NUMERIC
+TZ
+TERM"
+  RESUME_DIR=""
+  FORCE_RESUME=0
 
   # Parse arguments
   while [ $# -gt 0 ]; do
@@ -1082,6 +1366,35 @@ main() {
 "
         shift
         ;;
+      --capture-env)
+        shift
+        if [ -z "$1" ]; then
+          error "--capture-env requires a variable name"
+        fi
+        case "$1" in
+          ''|*[!A-Za-z0-9_]*)
+            error "--capture-env expects an environment variable name (got: $1)"
+            ;;
+        esac
+        CAPTURE_ENV="$CAPTURE_ENV
+$1"
+        shift
+        ;;
+      --resume)
+        shift
+        if [ -z "$1" ]; then
+          error "--resume requires a results directory"
+        fi
+        if [ ! -f "$1/benchmark.json" ]; then
+          error "--resume: no benchmark.json in $1"
+        fi
+        RESUME_DIR="$1"
+        shift
+        ;;
+      --force-resume)
+        FORCE_RESUME=1
+        shift
+        ;;
       --metrics-interval)
         shift
         if [ -z "$1" ]; then
@@ -1192,9 +1505,21 @@ main() {
   #   - Allows concurrent benchmarks with same --name without collision
   #   - PID ensures uniqueness even if started in same second
   #   - Chronological sorting by directory name
-  timestamp=$(date '+%Y%m%d-%H%M%S')
-  OUTPUT_DIR="./bench-results/${NAME}/${timestamp}-$$"
-  mkdir -p "$OUTPUT_DIR/runs"
+  if [ -n "$RESUME_DIR" ]; then
+    # Continue writing into the original result directory so the completed
+    # runs and the new ones form one result rather than two partial ones
+    OUTPUT_DIR="$RESUME_DIR"
+    mkdir -p "$OUTPUT_DIR/runs"
+    # A run interrupted mid-flight left an INCOMPLETE marker and no record;
+    # discard it so the run number is free to be used again.
+    for stale in "$OUTPUT_DIR/runs/"*/INCOMPLETE; do
+      [ -f "$stale" ] && rm -rf "$(dirname "$stale")"
+    done
+  else
+    timestamp=$(date '+%Y%m%d-%H%M%S')
+    OUTPUT_DIR="./bench-results/${NAME}/${timestamp}-$$"
+    mkdir -p "$OUTPUT_DIR/runs"
+  fi
 
   # Setup signal handlers
   trap 'handle_interrupt' INT TERM
@@ -1202,8 +1527,6 @@ main() {
   # Disable exit on error for benchmark loop (we track failures ourselves)
   set +e
 
-  # Run benchmark loop
-  run_num=1
   # Global so that cleanup() can reclaim them on any exit path
   TIMES_FILE=$(mktemp)
   EXIT_CODES_FILE=$(mktemp)
@@ -1211,6 +1534,8 @@ main() {
   MEASUREMENTS_FILE=$(mktemp)
   write_ingest_helper
   write_aggregate_helper
+  write_provenance_helper
+  write_resume_helper
 
   # Per-run validity tallies (schema 2.1)
   runs_valid=0
@@ -1221,6 +1546,88 @@ main() {
   status_evaluator_failed=0
   status_constraint_failed=0
   status_infrastructure_failed=0
+
+  # ---------------------------------------------------------------------------
+  # Provenance and resumption
+  # ---------------------------------------------------------------------------
+
+  # The fingerprint covers what must hold for two runs to belong to the same
+  # experiment. Cosmetic fields (--name, --message) and ephemeral ones (the
+  # PIDs behind --pid/--port) are excluded on purpose: they change between
+  # sittings without changing what is being measured.
+  config_file=$(mktemp)
+  {
+    printf 'command\t%s\n' "$COMMAND"
+    printf 'runs\t%s\n' "$RUNS"
+    printf 'expect_exit\t%s\n' "$EXPECT_EXIT"
+    printf 'evaluate\t%s\n' "$EVALUATE_CMD"
+    printf 'metrics_interval\t%s\n' "$METRICS_INTERVAL"
+    if [ -n "$REQUIRE_FILE" ]; then
+      sort "$REQUIRE_FILE" | while IFS= read -r c; do printf 'require\t%s\n' "$c"; done
+    fi
+    printf '%s' "$REQUIRE_ARTIFACTS" | sort | while IFS= read -r a; do
+      [ -n "$a" ] && printf 'require_artifact\t%s\n' "$a"
+    done
+  } > "$config_file"
+
+  env_allow_file=$(mktemp)
+  printf '%s\n' "$CAPTURE_ENV" > "$env_allow_file"
+
+  provenance_out=$(perl "$PROVENANCE_PL" "$config_file" "$env_allow_file" "bench-results")
+  rm -f "$config_file" "$env_allow_file"
+  config_fingerprint=$(printf '%s\n' "$provenance_out" | sed -n 's/^FINGERPRINT\t//p')
+  provenance_json=$(printf '%s\n' "$provenance_out" | sed -n 's/^JSON\t//p')
+
+  resumes_json="[]"
+  run_start=1
+  if [ -n "$RESUME_DIR" ]; then
+    resume_state=$(perl "$RESUME_PL" "$RESUME_DIR/benchmark.json" \
+                        "$RUNS_FILE" "$TIMES_FILE" "$EXIT_CODES_FILE" "$MEASUREMENTS_FILE") \
+      || error "could not read prior results in $RESUME_DIR"
+
+    prior_fingerprint=$(printf '%s\n' "$resume_state" | sed -n 's/^FINGERPRINT=//p')
+    prior_completed=$(printf '%s\n' "$resume_state" | sed -n 's/^COMPLETED=//p')
+    prior_valid=$(printf '%s\n' "$resume_state" | sed -n 's/^VALID=//p')
+    prior_requested=$(printf '%s\n' "$resume_state" | sed -n 's/^REQUESTED=//p')
+    resumes_json=$(printf '%s\n' "$resume_state" | sed -n 's/^RESUMES=//p')
+    [ -n "$resumes_json" ] || resumes_json="[]"
+
+    # Refuse to extend a sample that was produced under different conditions.
+    # An override is allowed but is written into the result, so a reader can
+    # see that the sample is not homogeneous.
+    mismatch=""
+    if [ "$prior_fingerprint" != "$config_fingerprint" ]; then
+      mismatch="configuration fingerprint differs from the original run"
+    fi
+    if [ -n "$mismatch" ] && [ "$FORCE_RESUME" -eq 0 ]; then
+      error "$mismatch. Re-run with the original options, or pass --force-resume to record an override."
+    fi
+
+    RUNS="$prior_requested"
+    RUNS_COMPLETED="$prior_completed"
+    runs_valid="$prior_valid"
+    run_start=$((prior_completed + 1))
+    for st in ok command_failed invalid_result declared_invalid \
+              evaluator_failed constraint_failed infrastructure_failed; do
+      n=$(printf '%s\n' "$resume_state" | sed -n "s/^STATUS_${st}=//p")
+      [ -n "$n" ] && eval "status_${st}=\$n"
+    done
+
+    override_json=$([ -n "$mismatch" ] && echo "true" || echo "false")
+    mismatch_json=$(json_escape "$mismatch")
+    resume_entry="{\"at\":\"$(get_iso_timestamp)\",\"resumed_from_run\":$prior_completed,\"override\":$override_json,\"mismatch\":\"$mismatch_json\"}"
+    # Append to the stored history: strip the closing bracket, add a separator
+    # when the array already has entries, then re-close.
+    resumes_base="${resumes_json%]}"
+    if [ "$resumes_base" = "[" ]; then
+      resumes_json="[$resume_entry]"
+    else
+      resumes_json="$resumes_base,$resume_entry]"
+    fi
+  fi
+
+  # The loop starts past whatever was restored (run 1 for a fresh benchmark)
+  run_num="$run_start"
 
   # Capture initial metrics for all monitored processes (for leak detection)
   initial_metrics=""
@@ -1364,6 +1771,10 @@ main() {
     evidence_json='{"artifacts":[],"declared_valid":null,"evidence":[],"metrics":{},"units":{}}'
     run_metrics_tsv="$run_dir/.metrics.tsv"
     : > "$run_metrics_tsv"
+    # Measurements are staged here and only folded into the global set once
+    # this run's validity is known, so each observation can be tagged with it.
+    run_measurements="$run_dir/.measurements.tsv"
+    : > "$run_measurements"
     declared_valid=""
     if ingest_out=$(perl "$INGEST_PL" "$run_dir/result.json" "$run_dir/metrics.jsonl" \
                          "run $run_num" "$run_dir/metrics.json" 2>"$ingest_err"); then
@@ -1371,7 +1782,7 @@ main() {
       printf '%s\n' "$ingest_out" | while IFS="$(printf '\t')" read -r kind a b c; do
         case "$kind" in
           METRIC)
-            printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$MEASUREMENTS_FILE"
+            printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$run_measurements"
             printf '%s\t%s\n' "$a" "$b" >> "$run_metrics_tsv"
             ;;
         esac
@@ -1421,7 +1832,7 @@ main() {
           printf '%s\n' "$eval_out" | while IFS="$(printf '\t')" read -r kind a b c; do
             case "$kind" in
               METRIC)
-                printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$MEASUREMENTS_FILE"
+                printf '%s\t%s\t%s\t%s\n' "$run_num" "$a" "$b" "$c" >> "$run_measurements"
                 printf '%s\t%s\n' "$a" "$b" >> "$run_metrics_tsv"
                 ;;
             esac
@@ -1485,6 +1896,14 @@ main() {
     esac
 
     run_valid_json=$([ "$run_status" = "ok" ] && echo "true" || echo "false")
+
+    # Fold this run's measurements into the global set, tagged with validity
+    run_valid_flag=$([ "$run_status" = "ok" ] && echo 1 || echo 0)
+    if [ -s "$run_measurements" ]; then
+      awk -F'\t' -v OFS='\t' -v v="$run_valid_flag" '{print $1, $2, $3, $4, v}' \
+        "$run_measurements" >> "$MEASUREMENTS_FILE"
+    fi
+    rm -f "$run_measurements"
     run_error_json=$(json_escape "$run_error")
 
     # Store per-run data as JSON line
@@ -1724,6 +2143,12 @@ main() {
   shell_json=$(json_escape "$SHELL")
   pwd_json=$(json_escape "$PWD")
 
+  # Splice the resume history into the provenance object captured at startup.
+  # Done here rather than in the helper so the history survives a resume of a
+  # resume: each sitting appends to what the previous one recorded.
+  provenance_full=$(printf '%s' "$provenance_json" | sed 's/}$//')
+  provenance_full="$provenance_full,\"resumes\":$resumes_json,\"finished\":\"$(get_iso_timestamp)\"}"
+
   # Generate JSON output.
   #
   # Written in three appends (header, runs array, tail) so the runs array is
@@ -1757,6 +2182,7 @@ main() {
     "infrastructure_failed": $status_infrastructure_failed
   },
   "metrics": $metrics_json,
+  "provenance": $provenance_full,
   "interrupted": $([ "$INTERRUPTED" -eq 1 ] && echo "true" || echo "false"),
   "timing": {
     "unit": "milliseconds",

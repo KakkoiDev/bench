@@ -1,6 +1,6 @@
 # General Benchmark Design
 
-Status: phases 1 and 2 implemented (schema 2.1); phases 3-6 proposed
+Status: phases 1, 2 and 5 implemented (schema 2.1); phases 3, 4 and 6 proposed
 
 ## Objective
 
@@ -370,15 +370,37 @@ Acceptance: one manifest can reproduce a baseline/candidate experiment with a re
 
 Acceptance: Bench can state the size and uncertainty of a change while showing whether correctness constraints passed.
 
-### Phase 5 — Provenance and resumption
+### Phase 5 — Provenance and resumption — implemented
 
-- [ ] Capture Git, input, tool, machine, and configuration fingerprints.
-- [ ] Add environment allowlisting and redaction.
-- [ ] Mark interrupted observations incomplete.
-- [ ] Resume matching experiments without repeating valid runs.
-- [ ] Detect and record resumption mismatches and overrides.
+- [x] Capture Git, input, tool, machine, and configuration fingerprints.
+- [x] Add environment allowlisting and redaction.
+- [x] Mark interrupted observations incomplete.
+- [x] Resume matching experiments without repeating valid runs.
+- [x] Detect and record resumption mismatches and overrides.
 
 Acceptance: another person or agent can inspect, resume, and audit an interrupted experiment.
+
+Taken before phases 3 and 4 deliberately. Independent evaluation and
+deterministic resumption are the two mechanisms this design is not already
+sharing with MLflow, Sacred, DVC and Snakemake; manifests, variants and
+comparison statistics are engineering those tools have had for years. Building
+the distinguishing half first also defers the question of whether a YAML parser
+and inferential statistics belong in POSIX shell at all.
+
+`--resume DIR` continues into the original result directory after verifying the
+configuration fingerprint — command, run count, exit requirement, evaluator,
+constraints, required artifacts and metrics interval, with `--name`/`--message`
+and the PIDs behind `--pid`/`--port` deliberately excluded. A mismatch is
+refused unless `--force-resume` records the override. Runs already recorded are
+kept, including invalid ones: re-rolling failures until they pass would bias the
+sample toward success. Only the `INCOMPLETE` run is redone, and every sitting
+appends to `provenance.resumes`.
+
+Provenance never dumps the environment: capture is opt-in via `--capture-env`,
+credential-shaped names are refused even when requested, and the count of
+omitted variables is recorded. Bench's own results directory is excluded from
+the git dirty check, so a resume does not report dirty merely because the
+previous sitting wrote files.
 
 ### Phase 6 — Domain demonstrations
 

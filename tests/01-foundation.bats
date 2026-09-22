@@ -54,3 +54,18 @@ EOF
   run shellcheck -s sh -e SC2034 "$BENCH_SCRIPT"
   [ "$status" -eq 0 ]
 }
+
+@test "documentation the tests depend on is tracked by git" {
+  # The repository ignores *.md by default with an allowlist, so a new
+  # document is silently excluded from commits unless it is added there.
+  # These tests read PROTOCOL.md, so an untracked copy would pass locally
+  # and fail on a fresh clone.
+  require_command git
+  cd "$ORIGINAL_DIR"
+
+  for doc in README.md PROTOCOL.md GENERAL-BENCHMARK-DESIGN.md; do
+    [ -f "$doc" ] || { echo "missing: $doc"; return 1; }
+    git check-ignore -q "$doc" && { echo "git-ignored: $doc"; return 1; }
+  done
+  return 0
+}
